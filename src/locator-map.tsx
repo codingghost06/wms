@@ -66,6 +66,46 @@ interface PopupState {
   content: string;
 }
 
+// Type for URL parameters
+interface UrlParams {
+  lat?: number;
+  lng?: number;
+  radius?: number; // in meters, default 1000m
+}
+
+// Parse URL parameters
+function getUrlParams(): UrlParams {
+  const urlParams = new URLSearchParams(window.location.search);
+  const lat = urlParams.get("lat");
+  const lng = urlParams.get("lng");
+  const radius = urlParams.get("radius");
+
+  return {
+    lat: lat ? parseFloat(lat) : undefined,
+    lng: lng ? parseFloat(lng) : undefined,
+    radius: radius ? parseFloat(radius) : 1000, // default 1km radius
+  };
+}
+
+// Calculate bounding box around a point
+function calculateBoundingBox(
+  lat: number,
+  lng: number,
+  radiusMeters: number
+): L.LatLngBounds {
+  // Approximate degrees per meter (rough calculation)
+  const latDegreePerMeter = 1 / 111320;
+  const lngDegreePerMeter = 1 / (111320 * Math.cos((lat * Math.PI) / 180));
+
+  const latOffset = radiusMeters * latDegreePerMeter;
+  const lngOffset = radiusMeters * lngDegreePerMeter;
+
+  const southwest = L.latLng(lat - latOffset, lng - lngOffset);
+  const northeast = L.latLng(lat + latOffset, lng + lngOffset);
+
+  return L.latLngBounds(southwest, northeast);
+}
+
 // --- Drawing controls hooked to the raw Leaflet map instance ---
 function DrawControl() {
   const map = useMap();
@@ -127,13 +167,16 @@ function DrawControl() {
 function buildGetFeatureInfoUrl(
   map: L.Map,
   latlng: L.LatLng,
-  visibleLayerKeys: string[]
+  visibleLayerKeys: string[],
+  spatialFilter?: L.LatLngBounds
 ): string | null {
   if (!visibleLayerKeys.length) return null;
 
   const point = map.latLngToContainerPoint(latlng);
   const size = map.getSize();
-  const bounds = map.getBounds();
+
+  // Use spatial filter bounds if provided, otherwise use current map bounds
+  const bounds = spatialFilter || map.getBounds();
 
   // Use EPSG:3857 to avoid axis-order confusion; project bounds to meters.
   const sw = L.CRS.EPSG3857.project(bounds.getSouthWest());
@@ -153,7 +196,7 @@ function buildGetFeatureInfoUrl(
     height: String(size.y),
     i: String(Math.round(point.x)), // WMS 1.3.0 uses i/j
     j: String(Math.round(point.y)),
-    feature_count: "10",
+    feature_count: "50", // Increased from 10 since we're filtering spatially
   });
 
   return `${WMS_URL}${WMS_URL.endsWith("?") ? "" : "?"}${params.toString()}`;
@@ -163,15 +206,22 @@ function buildGetFeatureInfoUrl(
 function MapClickInfo({
   visibleLayerKeys,
   setPopup,
+  spatialFilter,
 }: {
   visibleLayerKeys: string[];
   setPopup: (popup: PopupState | null) => void;
+  spatialFilter?: L.LatLngBounds;
 }) {
   const map = useMap();
 
   useMapEvents({
     async click(e) {
-      const url = buildGetFeatureInfoUrl(map, e.latlng, visibleLayerKeys);
+      const url = buildGetFeatureInfoUrl(
+        map,
+        e.latlng,
+        visibleLayerKeys,
+        spatialFilter
+      );
       if (!url) {
         setPopup({ latlng: e.latlng, content: "No layers selected." });
         return;
@@ -184,22 +234,31 @@ function MapClickInfo({
 
         if (ct.includes("application/json")) {
           const json = await resp.json();
-          const f = (json.features && json.features[0]) || null;
-          if (!f) {
+          const features = json.features || [];
+          if (features.length === 0) {
             html = "<b>No features at this point.</b>";
           } else {
-            const props = f.properties || {};
-            html =
-              '<div><b>Feature Info</b><table style="margin-top:6px;">' +
-              Object.entries(props)
+            // Show all features found, not just the first one
+            html = "<div><b>Feature Info</b>";
+            features.forEach((f: any, index: number) => {
+              const props = f.properties || {};
+              const layerName = f.id
+                ? f.id.split(".")[0]
+                : `Feature ${index + 1}`;
+              html += `<div style="margin-top:${
+                index > 0 ? "12px" : "6px"
+              };"><strong>${layerName}</strong><table style="margin-top:4px;">`;
+              html += Object.entries(props)
                 .map(
                   ([k, v]) =>
                     `<tr><td style="padding-right:8px;font-weight:600;">${k}</td><td>${String(
                       v
                     )}</td></tr>`
                 )
-                .join("") +
-              "</table></div>";
+                .join("");
+              html += "</table></div>";
+            });
+            html += "</div>";
           }
         } else {
           // Fallback: many GeoServer setups return HTML/text
@@ -222,13 +281,82 @@ function MapClickInfo({
   return null;
 }
 
+// Component to handle URL-based center and spatial filtering
+function UrlBasedMapController({
+  urlParams,
+  spatialFilter,
+}: {
+  urlParams: UrlParams;
+  spatialFilter?: L.LatLngBounds;
+}) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (urlParams.lat && urlParams.lng) {
+      // Center map on URL coordinates
+      map.setView([urlParams.lat, urlParams.lng], 15);
+
+      // Add a marker for the target location
+      const marker = L.marker([urlParams.lat, urlParams.lng])
+        .addTo(map)
+        .bindPopup(
+          `Target Location<br/>Lat: ${urlParams.lat}<br/>Lng: ${urlParams.lng}`
+        );
+
+      // Show the spatial filter area if provided
+      if (spatialFilter) {
+        const rectangle = L.rectangle(spatialFilter, {
+          color: "#ff7800",
+          weight: 2,
+          fillOpacity: 0.1,
+        }).addTo(map);
+
+        rectangle.bindPopup(`Search Area<br/>Radius: ${urlParams.radius}m`);
+      }
+
+      return () => {
+        map.removeLayer(marker);
+        if (spatialFilter) {
+          map.eachLayer((layer) => {
+            if (layer instanceof L.Rectangle) {
+              map.removeLayer(layer);
+            }
+          });
+        }
+      };
+    }
+  }, [map, urlParams, spatialFilter]);
+
+  return null;
+}
+
 export default function LocatorMap() {
   const [visible, setVisible] = useState(
     () => new Set<LayerKey>([LAYERS[0].key])
   ); // default: first layer on
   const [popup, setPopup] = useState<PopupState | null>(null);
 
+  const urlParams = useMemo(() => getUrlParams(), []);
+  const spatialFilter = useMemo(() => {
+    if (urlParams.lat && urlParams.lng && urlParams.radius) {
+      return calculateBoundingBox(
+        urlParams.lat,
+        urlParams.lng,
+        urlParams.radius
+      );
+    }
+    return undefined;
+  }, [urlParams]);
+
   const visibleLayerKeys = useMemo(() => Array.from(visible), [visible]);
+
+  // Default center - use URL params if available, otherwise Toronto
+  const defaultCenter: [number, number] =
+    urlParams.lat && urlParams.lng
+      ? [urlParams.lat, urlParams.lng]
+      : [43.7, -79.4];
+
+  const defaultZoom = urlParams.lat && urlParams.lng ? 15 : 12;
 
   function toggleLayer(key: LayerKey) {
     setVisible((prev) => {
@@ -264,7 +392,30 @@ export default function LocatorMap() {
       <div
         style={{ padding: 12, borderRight: "1px solid #eee", overflow: "auto" }}
       >
-        <h3 style={{ margin: "4px 0 12px" }}>Layers</h3>
+        <h3 style={{ margin: "4px 0 12px" }}>WMS Map Viewer</h3>
+
+        {/* URL Parameters Info */}
+        {urlParams.lat && urlParams.lng && (
+          <div
+            style={{
+              marginBottom: 16,
+              padding: 8,
+              backgroundColor: "#f0f8ff",
+              borderRadius: 4,
+              fontSize: 12,
+            }}
+          >
+            <strong>Target Location:</strong>
+            <br />
+            Lat: {urlParams.lat.toFixed(6)}
+            <br />
+            Lng: {urlParams.lng.toFixed(6)}
+            <br />
+            Radius: {urlParams.radius}m
+          </div>
+        )}
+
+        <h4 style={{ margin: "8px 0 8px", fontSize: 14 }}>Layers</h4>
         {LAYERS.map((l) => (
           <label
             key={l.key}
@@ -281,21 +432,34 @@ export default function LocatorMap() {
               onChange={() => toggleLayer(l.key)}
             />
             <span>{l.title}</span>
-            <code style={{ marginLeft: "auto", opacity: 0.6, fontSize: 12 }}>
+            <code style={{ marginLeft: "auto", opacity: 0.6, fontSize: 11 }}>
               {l.key}
             </code>
           </label>
         ))}
-        <p style={{ fontSize: 12, opacity: 0.8, marginTop: 12 }}>
-          Tip: Click the map to see feature info for all <em>selected</em>{" "}
-          layers.
-        </p>
+
+        <div style={{ marginTop: 16, fontSize: 12, opacity: 0.8 }}>
+          <p>
+            <strong>Usage:</strong>
+            <br />
+            • Click map for feature info
+            <br />• Add ?lat=43.7&lng=-79.4&radius=500 to URL for spatial
+            filtering
+          </p>
+          {spatialFilter && (
+            <p style={{ marginTop: 8, color: "#ff7800" }}>
+              🎯 <strong>Spatial filtering active!</strong>
+              <br />
+              Only showing data within {urlParams.radius}m of target.
+            </p>
+          )}
+        </div>
       </div>
 
       {/* Map container */}
       <MapContainer
-        center={[43.7, -79.4]} // Toronto-ish
-        zoom={12}
+        center={defaultCenter}
+        zoom={defaultZoom}
         style={{ height: "100%", width: "100%" }}
       >
         {/* Basemap */}
@@ -304,7 +468,7 @@ export default function LocatorMap() {
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
         />
 
-        {/* WMS overlays for each visible layer */}
+        {/* WMS overlays for each visible layer with spatial filtering */}
         {LAYERS.map((l, idx) =>
           visible.has(l.key) ? (
             <WMSTileLayer
@@ -318,15 +482,32 @@ export default function LocatorMap() {
               tiled={true}
               styles=""
               zIndex={200 + idx} // keep overlays above base
+              // Add spatial filtering if bounds are provided
+              {...(spatialFilter && {
+                // Add CQL_FILTER for spatial filtering (if your GeoServer supports it)
+                cql_filter: spatialFilter
+                  ? `BBOX(the_geom,${spatialFilter.getWest()},${spatialFilter.getSouth()},${spatialFilter.getEast()},${spatialFilter.getNorth()},'EPSG:4326')`
+                  : undefined,
+              })}
             />
           ) : null
         )}
 
+        {/* URL-based map controller */}
+        <UrlBasedMapController
+          urlParams={urlParams}
+          spatialFilter={spatialFilter}
+        />
+
         {/* Drawing tools */}
         <DrawControl />
 
-        {/* Click → GetFeatureInfo */}
-        <MapClickInfo visibleLayerKeys={visibleLayerKeys} setPopup={setPopup} />
+        {/* Click → GetFeatureInfo with spatial filtering */}
+        <MapClickInfo
+          visibleLayerKeys={visibleLayerKeys}
+          setPopup={setPopup}
+          spatialFilter={spatialFilter}
+        />
 
         {/* Info popup */}
         {popup && (
