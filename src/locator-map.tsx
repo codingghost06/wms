@@ -51,16 +51,40 @@ const WMS_URL = "http://35.183.38.140/geoserver/ows?";
 
 // === Configure the layers you want to expose (use exact <Name> from GetCapabilities) ===
 const LAYERS = [
-  { key: "waterloo:RSW_Mains", title: "Storm Mains" },
-  { key: "waterloo:Water_Mains", title: "Water Mains" },
-  { key: "waterloo:RSW_Manholes", title: "Storm Manholes" },
+  // General Infrastructure
   { key: "waterloo:Roads", title: "Roads" },
   { key: "waterloo:Addresses", title: "Addresses" },
+  { key: "waterloo:Boundary_RMW", title: "RMW Boundary" },
+  { key: "waterloo:CityTownVillage", title: "City/Town/Village" },
+
+  // Storm Water System (RSW)
+  { key: "waterloo:RSW_Mains", title: "Storm Mains" },
+  { key: "waterloo:RSW_Manholes", title: "Storm Manholes" },
+  { key: "waterloo:RSW_Catchbasins", title: "Storm Catchbasins" },
+  { key: "waterloo:RSW_Ceptors", title: "Storm Ceptors" },
+  { key: "waterloo:RSW_Culverts", title: "Storm Culverts" },
+  { key: "waterloo:RSW_Ditches", title: "Storm Ditches" },
+  { key: "waterloo:RSW_Inlets", title: "Storm Inlets" },
+  { key: "waterloo:RSW_Leads", title: "Storm Leads" },
+  { key: "waterloo:RSW_Outlets", title: "Storm Outlets" },
+  { key: "waterloo:RSW_Ponds", title: "Storm Ponds" },
+  { key: "waterloo:RSW_Subdrains", title: "Storm Subdrains" },
+
+  // Water Network (RWN)
+  { key: "waterloo:Water_Mains", title: "Water Mains" },
   { key: "waterloo:RWN_Mains", title: "Water Network Mains" },
   { key: "waterloo:RWN_Hydrants", title: "Fire Hydrants" },
-  { key: "waterloo:RSW_Catchbasins", title: "Storm Catchbasins" },
-  { key: "waterloo:RSW_Inlets", title: "Storm Inlets" },
+  { key: "waterloo:RWN_Chambers", title: "Water Chambers" },
+  { key: "waterloo:RWN_Junctions", title: "Water Junctions" },
+  { key: "waterloo:RWN_ServiceValves", title: "Water Service Valves" },
+  { key: "waterloo:RWN_Services", title: "Water Services" },
+  { key: "waterloo:RWN_Valves", title: "Water Valves" },
+  { key: "waterloo:Water_Services", title: "Water Services (Alt)" },
+
+  // Wastewater Network (RWWN)
   { key: "waterloo:RWWN_Mains", title: "Wastewater Mains" },
+  { key: "waterloo:RWWN_LateralLines", title: "Wastewater Lateral Lines" },
+  { key: "waterloo:RWWN_Manholes", title: "Wastewater Manholes" },
 ] as const;
 
 // Function to fetch available layers from GetCapabilities
@@ -268,6 +292,7 @@ function MapClickInfo({
 
         if (ct.includes("application/json")) {
           const json = await resp.json();
+          console.log(json);
           const features = json.features || [];
           if (features.length === 0) {
             html = "<b>No features at this point.</b>";
@@ -425,7 +450,7 @@ export default function LocatorMap() {
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "280px 1fr",
+        gridTemplateColumns: "320px 1fr",
         height: "100vh",
       }}
     >
@@ -503,32 +528,75 @@ export default function LocatorMap() {
           </div>
         )}
 
-        {LAYERS.map((l) => (
-          <label
-            key={l.key}
-            style={{
-              display: "flex",
-              alignItems: "center",
-              gap: 8,
-              marginBottom: 8,
-              backgroundColor: visible.has(l.key) ? "#e8f5e8" : "transparent",
-              padding: "4px",
-              borderRadius: "4px",
-            }}
-          >
-            <input
-              type="checkbox"
-              checked={visible.has(l.key)}
-              onChange={() => toggleLayer(l.key)}
-            />
-            <span>{l.title}</span>
-            {visible.has(l.key) && (
-              <span style={{ fontSize: 10, color: "green" }}>✓ Active</span>
-            )}
-            <code style={{ marginLeft: "auto", opacity: 0.6, fontSize: 11 }}>
-              {l.key}
-            </code>
-          </label>
+        {/* Render layers grouped by category */}
+        {[
+          {
+            title: "🏢 General Infrastructure",
+            layers: LAYERS.filter(
+              (l) =>
+                l.key.includes("Roads") ||
+                l.key.includes("Addresses") ||
+                l.key.includes("Boundary") ||
+                l.key.includes("City")
+            ),
+          },
+          {
+            title: "🌧️ Storm Water (RSW)",
+            layers: LAYERS.filter((l) => l.key.includes("RSW_")),
+          },
+          {
+            title: "💧 Water Network (RWN)",
+            layers: LAYERS.filter(
+              (l) => l.key.includes("RWN_") || l.key.includes("Water_")
+            ),
+          },
+          {
+            title: "🚰 Wastewater (RWWN)",
+            layers: LAYERS.filter((l) => l.key.includes("RWWN_")),
+          },
+        ].map((group) => (
+          <div key={group.title} style={{ marginBottom: 16 }}>
+            <h5
+              style={{
+                margin: "8px 0 6px",
+                fontSize: 12,
+                fontWeight: "bold",
+                color: "#333",
+                borderBottom: "1px solid #eee",
+                paddingBottom: 2,
+              }}
+            >
+              {group.title}
+            </h5>
+            {group.layers.map((l) => (
+              <label
+                key={l.key}
+                style={{
+                  display: "flex",
+                  alignItems: "center",
+                  gap: 8,
+                  marginBottom: 6,
+                  marginLeft: 8,
+                  backgroundColor: visible.has(l.key)
+                    ? "#e8f5e8"
+                    : "transparent",
+                  padding: "2px 4px",
+                  borderRadius: "4px",
+                  fontSize: 12,
+                }}
+              >
+                <input
+                  type="checkbox"
+                  checked={visible.has(l.key)}
+                  onChange={() => toggleLayer(l.key)}
+                />
+                <span>{l.title}</span>
+                {visible.has(l.key) && (
+                  <span style={{ fontSize: 9, color: "green" }}>✓</span>
+                )}
+              </label>
+            ))}
+          </div>
         ))}
 
         {/* Debug info */}
