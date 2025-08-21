@@ -51,12 +51,46 @@ const WMS_URL = "http://35.183.38.140/geoserver/ows?";
 
 // === Configure the layers you want to expose (use exact <Name> from GetCapabilities) ===
 const LAYERS = [
-  { key: "rmw:RSW_Mains", title: "Storm Mains" },
-  { key: "rmw:Water_Mains", title: "Water Mains" },
-  { key: "rmw:RSW_Manholes", title: "Manholes" },
-  { key: "rmw:Roads", title: "Roads" },
-  { key: "rmw:Addresses", title: "Addresses" },
+  { key: "waterloo:RSW_Mains", title: "Storm Mains" },
+  { key: "waterloo:Water_Mains", title: "Water Mains" },
+  { key: "waterloo:RSW_Manholes", title: "Storm Manholes" },
+  { key: "waterloo:Roads", title: "Roads" },
+  { key: "waterloo:Addresses", title: "Addresses" },
+  { key: "waterloo:RWN_Mains", title: "Water Network Mains" },
+  { key: "waterloo:RWN_Hydrants", title: "Fire Hydrants" },
+  { key: "waterloo:RSW_Catchbasins", title: "Storm Catchbasins" },
+  { key: "waterloo:RSW_Inlets", title: "Storm Inlets" },
+  { key: "waterloo:RWWN_Mains", title: "Wastewater Mains" },
 ] as const;
+
+// Function to fetch available layers from GetCapabilities
+async function fetchAvailableLayers(): Promise<string[]> {
+  try {
+    const capabilitiesUrl = `${WMS_URL}service=WMS&version=1.3.0&request=GetCapabilities`;
+    const response = await fetch(capabilitiesUrl);
+    const xmlText = await response.text();
+
+    // Parse XML to extract layer names
+    const parser = new DOMParser();
+    const xmlDoc = parser.parseFromString(xmlText, "text/xml");
+
+    // Get all Layer elements that have a Name child
+    const layerElements = xmlDoc.querySelectorAll("Layer > Name");
+    const layerNames: string[] = [];
+
+    layerElements.forEach((nameElement) => {
+      const layerName = nameElement.textContent?.trim();
+      if (layerName) {
+        layerNames.push(layerName);
+      }
+    });
+
+    return layerNames;
+  } catch (error) {
+    console.error("Error fetching capabilities:", error);
+    return [];
+  }
+}
 
 type LayerKey = (typeof LAYERS)[number]["key"];
 
@@ -335,6 +369,8 @@ export default function LocatorMap() {
     () => new Set<LayerKey>([LAYERS[0].key])
   ); // default: first layer on
   const [popup, setPopup] = useState<PopupState | null>(null);
+  const [availableLayers, setAvailableLayers] = useState<string[]>([]);
+  const [showAvailableLayers, setShowAvailableLayers] = useState(false);
 
   const urlParams = useMemo(() => getUrlParams(), []);
   const spatialFilter = useMemo(() => {
@@ -350,13 +386,13 @@ export default function LocatorMap() {
 
   const visibleLayerKeys = useMemo(() => Array.from(visible), [visible]);
 
-  // Default center - use URL params if available, otherwise Toronto
+  // Default center - use URL params if available, otherwise Waterloo, Ontario
   const defaultCenter: [number, number] =
     urlParams.lat && urlParams.lng
       ? [urlParams.lat, urlParams.lng]
-      : [43.7, -79.4];
+      : [43.4643, -80.5204]; // Waterloo, Ontario coordinates
 
-  const defaultZoom = urlParams.lat && urlParams.lng ? 15 : 12;
+  const defaultZoom = urlParams.lat && urlParams.lng ? 15 : 13;
 
   function toggleLayer(key: LayerKey) {
     setVisible((prev) => {
@@ -378,6 +414,11 @@ export default function LocatorMap() {
       shadowUrl:
         "https://unpkg.com/leaflet@1.9.4/dist/images/marker-shadow.png",
     });
+  }, []);
+
+  // Fetch available layers on component mount
+  useEffect(() => {
+    fetchAvailableLayers().then(setAvailableLayers);
   }, []);
 
   return (
@@ -416,6 +457,52 @@ export default function LocatorMap() {
         )}
 
         <h4 style={{ margin: "8px 0 8px", fontSize: 14 }}>Layers</h4>
+
+        {/* Button to show/hide available layers */}
+        <button
+          onClick={() => setShowAvailableLayers(!showAvailableLayers)}
+          style={{
+            marginBottom: 12,
+            padding: "4px 8px",
+            fontSize: 12,
+            backgroundColor: "#f0f0f0",
+            border: "1px solid #ccc",
+            borderRadius: 4,
+            cursor: "pointer",
+          }}
+        >
+          {showAvailableLayers ? "Hide" : "Show"} Available Layers (
+          {availableLayers.length})
+        </button>
+
+        {/* Show available layers from GetCapabilities */}
+        {showAvailableLayers && (
+          <div
+            style={{
+              marginBottom: 16,
+              padding: 8,
+              backgroundColor: "#f9f9f9",
+              borderRadius: 4,
+              fontSize: 11,
+              maxHeight: 200,
+              overflow: "auto",
+            }}
+          >
+            <strong>Available layers from GetCapabilities:</strong>
+            {availableLayers.length > 0 ? (
+              <ul style={{ margin: 0, paddingLeft: 16 }}>
+                {availableLayers.map((layer) => (
+                  <li key={layer} style={{ marginBottom: 2 }}>
+                    <code>{layer}</code>
+                  </li>
+                ))}
+              </ul>
+            ) : (
+              <p style={{ margin: 0, fontStyle: "italic" }}>Loading...</p>
+            )}
+          </div>
+        )}
+
         {LAYERS.map((l) => (
           <label
             key={l.key}
@@ -424,6 +511,9 @@ export default function LocatorMap() {
               alignItems: "center",
               gap: 8,
               marginBottom: 8,
+              backgroundColor: visible.has(l.key) ? "#e8f5e8" : "transparent",
+              padding: "4px",
+              borderRadius: "4px",
             }}
           >
             <input
@@ -432,11 +522,23 @@ export default function LocatorMap() {
               onChange={() => toggleLayer(l.key)}
             />
             <span>{l.title}</span>
+            {visible.has(l.key) && (
+              <span style={{ fontSize: 10, color: "green" }}>✓ Active</span>
+            )}
             <code style={{ marginLeft: "auto", opacity: 0.6, fontSize: 11 }}>
               {l.key}
             </code>
           </label>
         ))}
+
+        {/* Debug info */}
+        <div style={{ marginTop: 16, fontSize: 11, opacity: 0.7 }}>
+          <strong>Debug Info:</strong>
+          <br />
+          Active layers: {visibleLayerKeys.length}
+          <br />
+          Check browser console for loading errors
+        </div>
 
         <div style={{ marginTop: 16, fontSize: 12, opacity: 0.8 }}>
           <p>
@@ -482,6 +584,7 @@ export default function LocatorMap() {
               tiled={true}
               styles=""
               zIndex={200 + idx} // keep overlays above base
+              opacity={0.8} // Make layers slightly transparent so they're more visible
               // Add spatial filtering if bounds are provided
               {...(spatialFilter && {
                 // Add CQL_FILTER for spatial filtering (if your GeoServer supports it)
@@ -489,6 +592,12 @@ export default function LocatorMap() {
                   ? `BBOX(the_geom,${spatialFilter.getWest()},${spatialFilter.getSouth()},${spatialFilter.getEast()},${spatialFilter.getNorth()},'EPSG:4326')`
                   : undefined,
               })}
+              eventHandlers={{
+                loading: () => console.log(`Loading layer: ${l.key}`),
+                load: () => console.log(`Loaded layer: ${l.key}`),
+                tileerror: (e) =>
+                  console.error(`Error loading layer ${l.key}:`, e),
+              }}
             />
           ) : null
         )}
