@@ -116,6 +116,137 @@ async function fetchAvailableLayers(): Promise<string[]> {
   }
 }
 
+// Function to search for addresses using WFS (simplified approach)
+async function searchAddresses(searchTerm: string): Promise<SearchResult[]> {
+  try {
+    const wfsUrl = WMS_URL.replace("ows?", "ows");
+
+    // Get all features first (without CQL filter to avoid field name issues)
+    const params = new URLSearchParams({
+      service: "WFS",
+      version: "2.0.0",
+      request: "GetFeature",
+      typeName: "waterloo:Addresses",
+      outputFormat: "application/json",
+      maxFeatures: "100", // Get more features to filter client-side
+    });
+
+    const response = await fetch(`${wfsUrl}?${params.toString()}`);
+
+    // Check if response is JSON or XML (error)
+    const contentType = response.headers.get("content-type") || "";
+    if (contentType.includes("xml")) {
+      const errorText = await response.text();
+      console.error("WFS Error:", errorText);
+      return [];
+    }
+
+    const data = await response.json();
+
+    if (data.features && data.features.length > 0) {
+      // Log the first feature to see available fields (for debugging)
+      console.log("Sample address feature:", data.features[0]);
+      console.log(
+        "Available fields:",
+        Object.keys(data.features[0].properties)
+      );
+
+      // Filter results client-side based on the search term
+      const searchLower = searchTerm.toLowerCase();
+      const filteredFeatures = data.features.filter((feature: any) => {
+        const props = feature.properties;
+
+        // Search in all string properties
+        return Object.values(props).some(
+          (value: any) =>
+            value &&
+            typeof value === "string" &&
+            value.toLowerCase().includes(searchLower)
+        );
+      });
+
+      return filteredFeatures.slice(0, 20).map((feature: any) => {
+        const props = feature.properties;
+        const coords = feature.geometry.coordinates;
+
+        // Build address string from all available string fields
+        const addressParts: string[] = [];
+
+        // Add all non-null string values to create an address
+        Object.entries(props).forEach(([key, value]: [string, any]) => {
+          if (value && typeof value === "string" && value.trim()) {
+            // Skip obviously non-address fields
+            if (
+              !key.toLowerCase().includes("id") &&
+              !key.toLowerCase().includes("objectid") &&
+              !key.toLowerCase().includes("fid")
+            ) {
+              addressParts.push(value.trim());
+            }
+          }
+        });
+
+        return {
+          id: feature.id || `addr_${Math.random()}`,
+          address: addressParts.join(" ") || "Address",
+          coordinates: [coords[1], coords[0]] as [number, number], // Lat, Lng
+          properties: props,
+        };
+      });
+    }
+
+    return [];
+  } catch (error) {
+    console.error("Error searching addresses:", error);
+    return [];
+  }
+}
+
+// Function to search nearby infrastructure features
+async function searchNearbyFeatures(
+  coordinates: [number, number],
+  radiusMeters: number = 100,
+  layerKeys: string[]
+): Promise<any[]> {
+  try {
+    const [lat, lng] = coordinates;
+    const bbox = calculateBoundingBox(lat, lng, radiusMeters);
+
+    const results = await Promise.all(
+      layerKeys.map(async (layerKey) => {
+        try {
+          const wfsUrl = WMS_URL.replace("ows?", "ows");
+          const params = new URLSearchParams({
+            service: "WFS",
+            version: "2.0.0",
+            request: "GetFeature",
+            typeName: layerKey,
+            outputFormat: "application/json",
+            maxFeatures: "50",
+            bbox: `${bbox.getWest()},${bbox.getSouth()},${bbox.getEast()},${bbox.getNorth()},EPSG:4326`,
+          });
+
+          const response = await fetch(`${wfsUrl}?${params.toString()}`);
+          const data = await response.json();
+
+          return {
+            layerKey,
+            features: data.features || [],
+          };
+        } catch (error) {
+          console.error(`Error fetching features for ${layerKey}:`, error);
+          return { layerKey, features: [] };
+        }
+      })
+    );
+
+    return results.filter((result) => result.features.length > 0);
+  } catch (error) {
+    console.error("Error searching nearby features:", error);
+    return [];
+  }
+}
+
 type LayerKey = (typeof LAYERS)[number]["key"];
 
 // Type for popup state
@@ -129,6 +260,14 @@ interface UrlParams {
   lat?: number;
   lng?: number;
   radius?: number; // in meters, default 1000m
+}
+
+// Type for search results
+interface SearchResult {
+  id: string;
+  address: string;
+  coordinates: [number, number];
+  properties: Record<string, any>;
 }
 
 // Parse URL parameters
@@ -298,7 +437,8 @@ function MapClickInfo({
             html = "<b>No features at this point.</b>";
           } else {
             // Show all features found, not just the first one
-            html = "<div><b>Feature Info</b>";
+            html =
+              "<div style='max-height: 600px; overflow-y: auto;'><b>Feature Info</b>";
             features.forEach((f: any, index: number) => {
               const props = f.properties || {};
               const layerName = f.id
@@ -389,6 +529,83 @@ function UrlBasedMapController({
   return null;
 }
 
+// Component to handle search result highlighting
+function SearchResultController({
+  selectedResult,
+  nearbyFeatures,
+}: {
+  selectedResult: SearchResult | null;
+  nearbyFeatures: any[];
+}) {
+  const map = useMap();
+
+  useEffect(() => {
+    if (selectedResult) {
+      // Zoom to the selected location
+      map.setView(selectedResult.coordinates, 18);
+
+      // Create a highlight marker with custom styling
+      const highlightIcon = L.divIcon({
+        className: "search-highlight-marker",
+        html: `
+          <div style="
+            background: #ff4444; 
+            border: 3px solid white; 
+            border-radius: 50%; 
+            width: 20px; 
+            height: 20px;
+            box-shadow: 0 2px 6px rgba(0,0,0,0.3);
+            animation: pulse 2s infinite;
+          "></div>
+          <style>
+            @keyframes pulse {
+              0% { transform: scale(1); opacity: 1; }
+              50% { transform: scale(1.2); opacity: 0.7; }
+              100% { transform: scale(1); opacity: 1; }
+            }
+          </style>
+        `,
+        iconSize: [20, 20],
+        iconAnchor: [10, 10],
+      });
+
+      const marker = L.marker(selectedResult.coordinates, {
+        icon: highlightIcon,
+      })
+        .addTo(map)
+        .bindPopup(
+          `
+          <div>
+            <strong>📍 ${selectedResult.address}</strong>
+            <br/>
+            <small>Lat: ${selectedResult.coordinates[0].toFixed(6)}</small>
+            <br/>
+            <small>Lng: ${selectedResult.coordinates[1].toFixed(6)}</small>
+          </div>
+        `
+        )
+        .openPopup();
+
+      // Add a search radius circle
+      const circle = L.circle(selectedResult.coordinates, {
+        radius: 50, // 50 meters
+        color: "#ff4444",
+        fillColor: "#ff4444",
+        fillOpacity: 0.1,
+        weight: 2,
+        dashArray: "5, 5",
+      }).addTo(map);
+
+      return () => {
+        map.removeLayer(marker);
+        map.removeLayer(circle);
+      };
+    }
+  }, [map, selectedResult, nearbyFeatures]);
+
+  return null;
+}
+
 export default function LocatorMap() {
   const [visible, setVisible] = useState(
     () => new Set<LayerKey>([LAYERS[0].key])
@@ -396,6 +613,15 @@ export default function LocatorMap() {
   const [popup, setPopup] = useState<PopupState | null>(null);
   const [availableLayers, setAvailableLayers] = useState<string[]>([]);
   const [showAvailableLayers, setShowAvailableLayers] = useState(false);
+
+  // Search functionality state
+  const [searchTerm, setSearchTerm] = useState("");
+  const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
+  const [isSearching, setIsSearching] = useState(false);
+  const [selectedResult, setSelectedResult] = useState<SearchResult | null>(
+    null
+  );
+  const [nearbyFeatures, setNearbyFeatures] = useState<any[]>([]);
 
   const urlParams = useMemo(() => getUrlParams(), []);
   const spatialFilter = useMemo(() => {
@@ -446,6 +672,35 @@ export default function LocatorMap() {
     fetchAvailableLayers().then(setAvailableLayers);
   }, []);
 
+  // Search functionality
+  const handleSearch = async () => {
+    if (!searchTerm.trim()) return;
+
+    setIsSearching(true);
+    try {
+      const results = await searchAddresses(searchTerm);
+      setSearchResults(results);
+    } catch (error) {
+      console.error("Search error:", error);
+    } finally {
+      setIsSearching(false);
+    }
+  };
+
+  // Handle search result selection
+  const handleResultSelect = async (result: SearchResult) => {
+    setSelectedResult(result);
+    setSearchResults([]); // Hide search results
+
+    // Search for nearby features
+    const nearby = await searchNearbyFeatures(
+      result.coordinates,
+      50, // 50 meter radius
+      visibleLayerKeys
+    );
+    setNearbyFeatures(nearby);
+  };
+
   return (
     <div
       style={{
@@ -459,6 +714,137 @@ export default function LocatorMap() {
         style={{ padding: 12, borderRight: "1px solid #eee", overflow: "auto" }}
       >
         <h3 style={{ margin: "4px 0 12px" }}>WMS Map Viewer</h3>
+
+        {/* Search Section */}
+        <div style={{ marginBottom: 16 }}>
+          <h4 style={{ margin: "8px 0 8px", fontSize: 14 }}>🔍 Search</h4>
+          <div style={{ display: "flex", gap: 4 }}>
+            <input
+              type="text"
+              placeholder="Search addresses..."
+              value={searchTerm}
+              onChange={(e) => setSearchTerm(e.target.value)}
+              onKeyPress={(e) => e.key === "Enter" && handleSearch()}
+              style={{
+                flex: 1,
+                padding: "6px 8px",
+                fontSize: 12,
+                border: "1px solid #ccc",
+                borderRadius: 4,
+              }}
+            />
+            <button
+              onClick={handleSearch}
+              disabled={!searchTerm.trim() || isSearching}
+              style={{
+                padding: "6px 12px",
+                fontSize: 12,
+                backgroundColor: "#007cba",
+                color: "white",
+                border: "none",
+                borderRadius: 4,
+                cursor: "pointer",
+                opacity: !searchTerm.trim() || isSearching ? 0.6 : 1,
+              }}
+            >
+              {isSearching ? "..." : "Search"}
+            </button>
+          </div>
+
+          {/* Search Results */}
+          {searchResults.length > 0 && (
+            <div
+              style={{
+                marginTop: 8,
+                maxHeight: 120,
+                overflow: "auto",
+                border: "1px solid #ddd",
+                borderRadius: 4,
+                backgroundColor: "white",
+              }}
+            >
+              {searchResults.map((result) => (
+                <div
+                  key={result.id}
+                  onClick={() => handleResultSelect(result)}
+                  style={{
+                    padding: "6px 8px",
+                    fontSize: 11,
+                    borderBottom: "1px solid #eee",
+                    cursor: "pointer",
+                    backgroundColor: "white",
+                  }}
+                  onMouseEnter={(e) => {
+                    e.currentTarget.style.backgroundColor = "#f0f0f0";
+                  }}
+                  onMouseLeave={(e) => {
+                    e.currentTarget.style.backgroundColor = "white";
+                  }}
+                >
+                  📍 {result.address}
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* Selected Result Info */}
+          {selectedResult && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                backgroundColor: "#fff3cd",
+                borderRadius: 4,
+                fontSize: 11,
+                border: "1px solid #ffeaa7",
+              }}
+            >
+              <strong>📍 Selected:</strong> {selectedResult.address}
+              <br />
+              <button
+                onClick={() => {
+                  setSelectedResult(null);
+                  setNearbyFeatures([]);
+                }}
+                style={{
+                  marginTop: 4,
+                  padding: "2px 6px",
+                  fontSize: 10,
+                  backgroundColor: "#f39c12",
+                  color: "white",
+                  border: "none",
+                  borderRadius: 2,
+                  cursor: "pointer",
+                }}
+              >
+                Clear
+              </button>
+            </div>
+          )}
+
+          {/* Nearby Features */}
+          {nearbyFeatures.length > 0 && (
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                backgroundColor: "#e8f5e8",
+                borderRadius: 4,
+                fontSize: 11,
+                maxHeight: 100,
+                overflow: "auto",
+              }}
+            >
+              <strong>🏗️ Nearby Infrastructure:</strong>
+              {nearbyFeatures.map((layer) => (
+                <div key={layer.layerKey} style={{ marginTop: 4 }}>
+                  <strong>{layer.layerKey.split(":")[1]}:</strong>{" "}
+                  {layer.features.length} features
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
 
         {/* URL Parameters Info */}
         {urlParams.lat && urlParams.lng && (
@@ -674,6 +1060,12 @@ export default function LocatorMap() {
         <UrlBasedMapController
           urlParams={urlParams}
           spatialFilter={spatialFilter}
+        />
+
+        {/* Search result controller */}
+        <SearchResultController
+          selectedResult={selectedResult}
+          nearbyFeatures={nearbyFeatures}
         />
 
         {/* Drawing tools */}
