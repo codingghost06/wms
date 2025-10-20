@@ -47,7 +47,12 @@ interface DrawEvent {
 }
 
 // === YOUR GEOserver WMS base URL (no query params beyond '?') ===
-const WMS_URL = "http://35.183.38.140/geoserver/ows?";
+// Use environment variable or default to HTTP for local dev, HTTPS for production
+const WMS_URL =
+  import.meta.env.VITE_WMS_URL ||
+  (window.location.protocol === "https:"
+    ? "https://35.183.38.140/geoserver/ows?"
+    : "http://35.183.38.140/geoserver/ows?");
 
 // === S3 BUCKET CONFIGURATION (for drawing links) ===
 const S3_BASE = "https://ticketviewgis.s3.ca-central-1.amazonaws.com";
@@ -523,7 +528,7 @@ function getUrlParams(): UrlParams {
   return {
     lat: lat ? parseFloat(lat) : undefined,
     lng: lng ? parseFloat(lng) : undefined,
-    radius: radius ? parseFloat(radius) : 1000, // default 1km radius
+    radius: radius ? parseFloat(radius) : 100, // default 1km radius
   };
 }
 
@@ -546,8 +551,107 @@ function calculateBoundingBox(
   return L.latLngBounds(southwest, northeast);
 }
 
+// === MEASUREMENT HELPER FUNCTIONS ===
+
+// Calculate distance between two lat/lng points (Haversine formula)
+function calculateDistance(latlng1: L.LatLng, latlng2: L.LatLng): number {
+  const R = 6371e3; // Earth's radius in meters
+  const φ1 = (latlng1.lat * Math.PI) / 180;
+  const φ2 = (latlng2.lat * Math.PI) / 180;
+  const Δφ = ((latlng2.lat - latlng1.lat) * Math.PI) / 180;
+  const Δλ = ((latlng2.lng - latlng1.lng) * Math.PI) / 180;
+
+  const a =
+    Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+    Math.cos(φ1) * Math.cos(φ2) * Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+  const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+  return R * c; // Distance in meters
+}
+
+// Calculate total length of a polyline
+function calculatePolylineLength(latlngs: L.LatLng[]): number {
+  let totalDistance = 0;
+  for (let i = 0; i < latlngs.length - 1; i++) {
+    totalDistance += calculateDistance(latlngs[i], latlngs[i + 1]);
+  }
+  return totalDistance;
+}
+
+// Calculate area of a polygon using Shoelace formula
+function calculatePolygonArea(latlngs: L.LatLng[]): number {
+  const R = 6371e3; // Earth's radius in meters
+  let area = 0;
+
+  if (latlngs.length < 3) return 0;
+
+  for (let i = 0; i < latlngs.length; i++) {
+    const j = (i + 1) % latlngs.length;
+    const xi = latlngs[i].lng * (Math.PI / 180);
+    const yi = latlngs[i].lat * (Math.PI / 180);
+    const xj = latlngs[j].lng * (Math.PI / 180);
+    const yj = latlngs[j].lat * (Math.PI / 180);
+
+    area += xi * Math.sin(yj) - xj * Math.sin(yi);
+  }
+
+  area = Math.abs(area * R * R) / 2;
+  return area;
+}
+
+// Calculate bearing between two points
+function calculateBearing(latlng1: L.LatLng, latlng2: L.LatLng): number {
+  const φ1 = (latlng1.lat * Math.PI) / 180;
+  const φ2 = (latlng2.lat * Math.PI) / 180;
+  const Δλ = ((latlng2.lng - latlng1.lng) * Math.PI) / 180;
+
+  const y = Math.sin(Δλ) * Math.cos(φ2);
+  const x =
+    Math.cos(φ1) * Math.sin(φ2) - Math.sin(φ1) * Math.cos(φ2) * Math.cos(Δλ);
+
+  const θ = Math.atan2(y, x);
+  const bearing = ((θ * 180) / Math.PI + 360) % 360;
+
+  return bearing;
+}
+
+// Format distance for display
+function formatDistance(meters: number): string {
+  if (meters < 1000) {
+    return `${meters.toFixed(2)} m`;
+  } else {
+    return `${(meters / 1000).toFixed(3)} km`;
+  }
+}
+
+// Format area for display
+function formatArea(squareMeters: number): string {
+  if (squareMeters < 10000) {
+    return `${squareMeters.toFixed(2)} m²`;
+  } else {
+    const hectares = squareMeters / 10000;
+    const km2 = squareMeters / 1000000;
+    if (hectares < 100) {
+      return `${hectares.toFixed(3)} ha`;
+    } else {
+      return `${km2.toFixed(3)} km²`;
+    }
+  }
+}
+
+// Format bearing for display
+function formatBearing(degrees: number): string {
+  const directions = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"];
+  const index = Math.round(degrees / 45) % 8;
+  return `${degrees.toFixed(1)}° (${directions[index]})`;
+}
+
 // --- Drawing controls hooked to the raw Leaflet map instance ---
-function DrawControl() {
+function DrawControl({
+  setIsDrawing,
+}: {
+  setIsDrawing: (val: boolean) => void;
+}) {
   const map = useMap();
 
   useEffect(() => {
@@ -582,6 +686,8 @@ function DrawControl() {
         L.geoJSON(geojson, {
           onEachFeature: (_feature, layer) => {
             drawnItems.addLayer(layer);
+            // Add measurement labels for loaded drawings
+            setTimeout(() => addMeasurementLabels(layer), 100);
           },
         });
       }
@@ -595,14 +701,142 @@ function DrawControl() {
       console.log("Drawings saved to localStorage");
     }
 
+    // Add measurement labels on segments
+    function addMeasurementLabels(layer: any) {
+      if (layer instanceof L.Polyline && !(layer instanceof L.Polygon)) {
+        // Polyline - add distance labels on each segment
+        const latlngs = layer.getLatLngs() as L.LatLng[];
+        const distance = calculatePolylineLength(latlngs);
+
+        for (let i = 0; i < latlngs.length - 1; i++) {
+          const midpoint = L.latLng(
+            (latlngs[i].lat + latlngs[i + 1].lat) / 2,
+            (latlngs[i].lng + latlngs[i + 1].lng) / 2
+          );
+          const segmentDistance = calculateDistance(latlngs[i], latlngs[i + 1]);
+
+          const label = L.marker(midpoint, {
+            icon: L.divIcon({
+              className: "measurement-label-marker",
+              html: `<div class="measurement-text">${formatDistance(
+                segmentDistance
+              )}</div>`,
+              iconSize: [0, 0],
+              iconAnchor: [0, 0],
+            }),
+          });
+          label.addTo(map);
+          drawnItems.addLayer(label);
+        }
+
+        console.log(`📏 Line drawn: ${formatDistance(distance)}`);
+        if (latlngs.length === 2) {
+          const bearing = calculateBearing(latlngs[0], latlngs[1]);
+          console.log(`   └─ Bearing: ${formatBearing(bearing)}`);
+        }
+      } else if (layer instanceof L.Polygon || layer instanceof L.Rectangle) {
+        // Polygon/Rectangle - add distance labels on each side + area in center
+        let latlngs: L.LatLng[];
+
+        if (layer instanceof L.Rectangle) {
+          const bounds = layer.getBounds();
+          latlngs = [
+            bounds.getSouthWest(),
+            bounds.getSouthEast(),
+            bounds.getNorthEast(),
+            bounds.getNorthWest(),
+          ];
+        } else {
+          latlngs = layer.getLatLngs()[0] as L.LatLng[];
+        }
+
+        const area = calculatePolygonArea(latlngs);
+
+        // Add distance labels on each edge
+        for (let i = 0; i < latlngs.length; i++) {
+          const next = (i + 1) % latlngs.length;
+          const midpoint = L.latLng(
+            (latlngs[i].lat + latlngs[next].lat) / 2,
+            (latlngs[i].lng + latlngs[next].lng) / 2
+          );
+          const segmentDistance = calculateDistance(latlngs[i], latlngs[next]);
+
+          const label = L.marker(midpoint, {
+            icon: L.divIcon({
+              className: "measurement-label-marker",
+              html: `<div class="measurement-text">${formatDistance(
+                segmentDistance
+              )}</div>`,
+              iconSize: [0, 0],
+              iconAnchor: [0, 0],
+            }),
+          });
+          label.addTo(map);
+          drawnItems.addLayer(label);
+        }
+
+        // Add area label in the center
+        const bounds = layer.getBounds();
+        const center = bounds.getCenter();
+
+        const areaLabel = L.marker(center, {
+          icon: L.divIcon({
+            className: "measurement-area-label-marker",
+            html: `<div class="measurement-area-text">${formatArea(
+              area
+            )}</div>`,
+            iconSize: [0, 0],
+            iconAnchor: [0, 0],
+          }),
+        });
+        areaLabel.addTo(map);
+        drawnItems.addLayer(areaLabel);
+
+        console.log(`📐 Polygon drawn: ${formatArea(area)}`);
+      } else if (layer instanceof L.Marker) {
+        // Marker - show coordinates as tooltip
+        const latlng = layer.getLatLng();
+        layer.bindTooltip(
+          `Lat: ${latlng.lat.toFixed(6)}<br/>Lng: ${latlng.lng.toFixed(6)}`,
+          { permanent: false, direction: "top" }
+        );
+      }
+    }
+
     function onCreated(e: DrawEvent) {
       drawnItems.addLayer(e.layer);
       const gj = e.layer.toGeoJSON();
       console.log("DRAWN GEOJSON:", gj);
+
+      // Add measurement labels directly on the map
+      addMeasurementLabels(e.layer);
+
       saveDrawings(); // Auto-save on create
     }
-    function onEdited(e: unknown) {
+    function onEdited(e: any) {
       console.log("EDITED:", e);
+
+      // Remove all measurement labels and recreate them
+      const labelsToRemove: any[] = [];
+      drawnItems.eachLayer((l: any) => {
+        if (
+          l instanceof L.Marker &&
+          (l.options.icon?.options?.className === "measurement-label-marker" ||
+            l.options.icon?.options?.className ===
+              "measurement-area-label-marker")
+        ) {
+          labelsToRemove.push(l);
+        }
+      });
+      labelsToRemove.forEach((l) => drawnItems.removeLayer(l));
+
+      // Re-add measurement labels for all shapes
+      if (e.layers) {
+        e.layers.eachLayer((layer: any) => {
+          addMeasurementLabels(layer);
+        });
+      }
+
       saveDrawings(); // Auto-save on edit
     }
     function onDeleted(e: unknown) {
@@ -613,6 +847,14 @@ function DrawControl() {
     map.on(drawEvents.CREATED, onCreated);
     map.on(drawEvents.EDITED, onEdited);
     map.on(drawEvents.DELETED, onDeleted);
+
+    // Track drawing state to disable feature info
+    map.on("draw:drawstart", () => setIsDrawing(true));
+    map.on("draw:drawstop", () => setIsDrawing(false));
+    map.on("draw:editstart", () => setIsDrawing(true));
+    map.on("draw:editstop", () => setIsDrawing(false));
+    map.on("draw:deletestart", () => setIsDrawing(true));
+    map.on("draw:deletestop", () => setIsDrawing(false));
 
     // Create export/clear controls
     const exportControl = L.Control.extend({
@@ -749,15 +991,22 @@ function MapClickInfo({
   visibleLayerKeys,
   setPopup,
   spatialFilter,
+  isDrawing,
 }: {
   visibleLayerKeys: string[];
   setPopup: (popup: PopupState | null) => void;
   spatialFilter?: L.LatLngBounds;
+  isDrawing: boolean;
 }) {
   const map = useMap();
 
   useMapEvents({
     async click(e) {
+      // Don't query features when drawing
+      if (isDrawing) {
+        return;
+      }
+
       const url = buildGetFeatureInfoUrl(
         map,
         e.latlng,
@@ -1008,11 +1257,12 @@ function SearchResultController({
 
 export default function LocatorMap() {
   const [visible, setVisible] = useState(
-    () => new Set<LayerKey>([LAYERS[0].key])
-  ); // default: first layer on
+    () => new Set<LayerKey>(LAYERS.map((l) => l.key))
+  ); // default: all layers on
   const [popup, setPopup] = useState<PopupState | null>(null);
   const [availableLayers, setAvailableLayers] = useState<string[]>([]);
   const [showAvailableLayers, setShowAvailableLayers] = useState(false);
+  const [isDrawing, setIsDrawing] = useState(false);
 
   // Search functionality state
   const [searchTerm, setSearchTerm] = useState("");
@@ -1068,6 +1318,22 @@ export default function LocatorMap() {
     });
   }
 
+  function selectAllLayers() {
+    setVisible(new Set(LAYERS.map((l) => l.key)));
+    console.log(
+      `%c✅ ALL LAYERS ENABLED (${LAYERS.length})`,
+      "color: #10b981; font-weight: bold; font-size: 13px"
+    );
+  }
+
+  function deselectAllLayers() {
+    setVisible(new Set());
+    console.log(
+      `%c⬜ ALL LAYERS DISABLED`,
+      "color: #94a3b8; font-weight: bold"
+    );
+  }
+
   // Fix default marker icon paths when bundling
   useEffect(() => {
     // @ts-expect-error - This is a known workaround for Leaflet + bundlers
@@ -1087,6 +1353,27 @@ export default function LocatorMap() {
       `%c🗺️ WMS MAP VIEWER INITIALIZED`,
       "color: #0f172a; font-weight: bold; font-size: 14px; background: #fbbf24; padding: 4px 8px; border-radius: 4px"
     );
+    console.log(
+      `%c🌐 Protocol: ${window.location.protocol}`,
+      "color: #1e40af; font-weight: bold"
+    );
+    console.log(
+      `%c🔗 WMS URL: ${WMS_URL}`,
+      WMS_URL.startsWith("https")
+        ? "color: #10b981; font-weight: bold"
+        : "color: #f59e0b; font-weight: bold"
+    );
+
+    if (window.location.protocol === "https:" && WMS_URL.startsWith("http:")) {
+      console.warn(
+        `%c⚠️ MIXED CONTENT WARNING!`,
+        "color: #ef4444; font-weight: bold; font-size: 13px; background: #fef2f2; padding: 4px 8px"
+      );
+      console.warn(`   └─ Page is HTTPS but GeoServer is HTTP`);
+      console.warn(`   └─ Browser will block requests!`);
+      console.warn(`   └─ See DEPLOYMENT-GUIDE.md for solutions`);
+    }
+
     console.log(
       `%c📊 Total available layers: ${LAYERS.length}`,
       "color: #1e40af; font-weight: bold"
@@ -1342,6 +1629,42 @@ export default function LocatorMap() {
         <h4 style={{ margin: "0 0 12px", fontSize: 14, color: "#1e293b" }}>
           📚 Layers
         </h4>
+
+        {/* Select All / Deselect All buttons */}
+        <div style={{ display: "flex", gap: 6, marginBottom: 12 }}>
+          <button
+            onClick={selectAllLayers}
+            style={{
+              flex: 1,
+              padding: "6px 10px",
+              fontSize: 12,
+              backgroundColor: "#10b981",
+              color: "white",
+              border: "none",
+              borderRadius: 8,
+              cursor: "pointer",
+              fontWeight: 600,
+            }}
+          >
+            ✓ Select All
+          </button>
+          <button
+            onClick={deselectAllLayers}
+            style={{
+              flex: 1,
+              padding: "6px 10px",
+              fontSize: 12,
+              backgroundColor: "#ef4444",
+              color: "white",
+              border: "none",
+              borderRadius: 8,
+              cursor: "pointer",
+              fontWeight: 600,
+            }}
+          >
+            ✕ Deselect All
+          </button>
+        </div>
 
         {/* Button to show/hide available layers */}
         <button
@@ -1645,12 +1968,16 @@ export default function LocatorMap() {
       <MapContainer
         center={defaultCenter}
         zoom={defaultZoom}
+        maxZoom={22}
+        minZoom={3}
         style={{ height: "100%", width: "100%" }}
       >
         {/* Basemap */}
         <TileLayer
           attribution="&copy; OpenStreetMap contributors"
           url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
+          maxZoom={22}
+          maxNativeZoom={19}
         />
 
         {/* WMS overlays for each visible layer with spatial filtering */}
@@ -1675,6 +2002,8 @@ export default function LocatorMap() {
               styles=""
               zIndex={200 + idx} // keep overlays above base
               opacity={styleConfig.opacity}
+              maxZoom={22}
+              maxNativeZoom={18}
               // Add spatial filtering if bounds are provided
               {...(spatialFilter && {
                 // Add CQL_FILTER for spatial filtering (if your GeoServer supports it)
@@ -1738,13 +2067,14 @@ export default function LocatorMap() {
         />
 
         {/* Drawing tools */}
-        <DrawControl />
+        <DrawControl setIsDrawing={setIsDrawing} />
 
         {/* Click → GetFeatureInfo with spatial filtering */}
         <MapClickInfo
           visibleLayerKeys={visibleLayerKeys}
           setPopup={setPopup}
           spatialFilter={spatialFilter}
+          isDrawing={isDrawing}
         />
 
         {/* Info popup */}

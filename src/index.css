@@ -122,3 +122,56 @@ button:disabled {
 ::-webkit-scrollbar-thumb:hover {
   background: #94a3b8;
 }
+
+/* Measurement label styling */
+.measurement-label-marker,
+.measurement-area-label-marker {
+  pointer-events: none !important;
+  z-index: 1000 !important;
+}
+
+.measurement-text {
+  background: #fbbf24;
+  color: #78350f;
+  padding: 3px 8px;
+  border-radius: 4px;
+  font-size: 11px;
+  font-weight: bold;
+  white-space: nowrap;
+  border: 1px solid #f59e0b;
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.2);
+  font-family: system-ui, -apple-system, sans-serif;
+  transform: translate(-50%, -50%);
+  display: inline-block;
+}
+
+.measurement-area-text {
+  background: #fbbf24;
+  color: #78350f;
+  padding: 5px 12px;
+  border-radius: 4px;
+  font-size: 13px;
+  font-weight: bold;
+  white-space: nowrap;
+  border: 2px solid #f59e0b;
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.3);
+  font-family: system-ui, -apple-system, sans-serif;
+  transform: translate(-50%, -50%);
+  display: inline-block;
+}
+
+/* Drawing controls custom styling */
+.leaflet-draw-toolbar a {
+  background-color: white;
+  border-radius: 4px;
+}
+
+.leaflet-draw-toolbar a:hover {
+  background-color: #f3f4f6;
+}
+
+/* Ensure measurement labels stay on top */
+.leaflet-marker-pane .measurement-label-marker,
+.leaflet-marker-pane .measurement-area-label-marker {
+  z-index: 1000 !important;
+}
