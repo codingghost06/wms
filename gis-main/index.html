@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta http-equiv="Content-Type" content="text/html; charset=utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>S3 Browser</title>
+  <style>
+    body { font-family: system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif; margin:0; background:#f8fafc; }
+    header { padding:12px 16px; background:#0f172a; color:#fff; display:flex; align-items:center; gap:12px; }
+    header a { color:#93c5fd; text-decoration:none; }
+    main { padding:16px; max-width:1100px; margin:0 auto; }
+    .crumbs { font-size:14px; margin-bottom:12px; }
+    .grid { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
+    @media (max-width:800px){ .grid { grid-template-columns:1fr; } }
+    .card { border:1px solid #e5e7eb; border-radius:10px; padding:10px 12px; background:#fff; }
+    .folder { font-weight:600; }
+    .muted { color:#6b7280; font-size:12px; }
+    .viewer { border:0; width:100%; height:80vh; }
+    .btn { display:inline-block; padding:8px 12px; border:1px solid #d1d5db; border-radius:8px; text-decoration:none; color:#111827; background:#f9fafb; cursor:pointer; }
+    .btn:hover { background:#f3f4f6; }
+    .toolbar { display:flex; gap:8px; align-items:center; margin:8px 0 16px; flex-wrap:wrap; }
+    .mono { font-family: ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace; }
+    .error { color:#b91c1c; }
+    .note { color:#374151; background:#f3f4f6; border-radius:8px; padding:6px 8px; display:inline-block; margin:8px 0; }
+    .searchbar { margin-left:auto; display:flex; gap:8px; align-items:center; }
+    .input { padding:6px 10px; border:1px solid #d1d5db; border-radius:8px; min-width:260px; }
+    .small { font-size:12px; }
+  </style>
+
+  <!-- libs next to this file -->
+  <script src="./pako.min.js"></script>
+  <script src="./utif.umd.v2.min.js"></script>
+</head>
+<body>
+<header>
+  <div style="font-weight:800">S3 Browser</div>
+  <div class="muted" id="bucketInfo"></div>
+  <div class="searchbar">
+    <input id="searchInputTop" class="input" type="text" placeholder="Search drawing or file (e.g., K602 or K992-069)">
+    <button id="searchBtnTop" class="btn" type="button">Search</button>
+  </div>
+  <a id="rootLink" href="?">Root</a>
+</header>
+<main><div id="app"></div></main>
+
+<script>
+/*** CONFIG ***/
+var BUCKET = 'ticketviewgis';
+var REGION = 'ca-central-1';
+
+/*** Preview policy ***/
+var HARD_PIXEL_LIMIT = 240000000;     // 240 MP
+var TARGET_PREVIEW_PIXELS = 12000000; // ~12 MP
+
+// ---------- Helpers ----------
+var qs = new URLSearchParams(location.search);
+var prefix = qs.get('prefix') || '';
+var viewKey = qs.get('view');
+var s3Base = 'https://' + BUCKET + '.s3.' + REGION + '.amazonaws.com';
+
+function trimTrailingSlash(s){ return s && s.charAt(s.length-1) === '/' ? s.slice(0,-1) : s; }
+function encKey(key){ return key.split('/').map(encodeURIComponent).join('/'); }
+function humanSize(bytes){
+  var b = Number(bytes); if(!isFinite(b)) return '';
+  var u = ['B','KB','MB','GB','TB'], i=0, n=b; while(n>=1024 && i<u.length-1){ n/=1024; i++; }
+  return (n<10?n.toFixed(2):n.toFixed(1)) + ' ' + u[i];
+}
+function crumbsHTML(){
+  if(!prefix) return '<a href="?">/</a>';
+  var pfx = trimTrailingSlash(prefix), parts = pfx.split('/'), path = '', items = ['<a href="?">/</a>'];
+  for(var i=0;i<parts.length;i++){ path += parts[i] + '/'; items.push('<a href="?prefix='+encodeURIComponent(path)+'">'+parts[i]+'</a>'); }
+  return items.join(' <span class="muted">/</span> ');
+}
+function parentPrefixOfKey(k){ var i = k.lastIndexOf('/'); return i >= 0 ? k.slice(0, i+1) : ''; }
+function filenameFromKey(k){ var i=k.lastIndexOf('/'); return i>=0 ? k.slice(i+1) : k; }
+function stripExt(name){ var j=name.lastIndexOf('.'); return j>0 ? name.slice(0,j) : name; }
+function baseNoExt(k){ return stripExt(filenameFromKey(k)); }
+function extLower(k){ var i=k.lastIndexOf('.'); return i>0 ? k.slice(i+1).toLowerCase() : ''; }
+function unique(arr){ var seen={}, out=[]; for(var i=0;i<arr.length;i++){ var v=arr[i]; if(!seen[v]){ seen[v]=1; out.push(v);} } return out; }
+function looksLikeDrawingToken(q){ var m = String(q||'').trim().match(/[A-Za-z]\d{2,}/); return m ? m[0].toLowerCase() : ''; }
+function lastSegment(path){ var p = trimTrailingSlash(path||''); if(!p) return ''; var parts = p.split('/'); return parts[parts.length-1] || ''; }
+function suggestFromPrefix(pfx){ var last = lastSegment(pfx); return looksLikeDrawingToken(last) || last || ''; }
+
+// ---------- S3 list helpers & cache ----------
+function parseXML(xmlText){ return new DOMParser().parseFromString(xmlText,'text/xml'); }
+function getText(node, tag){ var el=node.getElementsByTagName(tag)[0]; return el?el.textContent:''; }
+
+var listCache = {}; // key = prefix + '|' + delimiter
+async function listAll(prefixArg, delimiter){
+  var prefixes=[], objects=[], token=null;
+  while(true){
+    var url = s3Base+'/?list-type=2&prefix='+encodeURIComponent(prefixArg);
+    if (delimiter) url += '&delimiter=' + encodeURIComponent(delimiter);
+    if (token) url += '&continuation-token=' + encodeURIComponent(token);
+    var r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' listing ' + prefixArg);
+    var xml = parseXML(await r.text());
+    var cp = xml.getElementsByTagName('CommonPrefixes');
+    for (var i=0;i<cp.length;i++){ var p = getText(cp[i],'Prefix'); if (p) prefixes.push(p); }
+    var cont = xml.getElementsByTagName('Contents');
+    for (var j=0;j<cont.length;j++){
+      var k=getText(cont[j],'Key'); if (k && k.slice(-1) !== '/'){
+        objects.push({ key:k, size:getText(cont[j],'Size'), lastmod:getText(cont[j],'LastModified') });
+      }
+    }
+    if (getText(xml,'IsTruncated') !== 'true') break;
+    token = getText(xml,'NextContinuationToken');
+    if (!token) break;
+  }
+  return { prefixes:prefixes, objects:objects };
+}
+function listAllCached(prefixArg, delimiter){
+  var key = prefixArg + '|' + (delimiter || '');
+  if (!listCache[key]) listCache[key] = listAll(prefixArg, delimiter);
+  return listCache[key];
+}
+
+// ---------- Concurrency limiter ----------
+function pLimit(max){
+  var active = 0, queue = [];
+  function run(fn, resolve, reject){
+    active++;
+    Promise.resolve().then(fn).then(function(v){ resolve(v); }, reject).finally(function(){
+      active--; if (queue.length){ var next = queue.shift(); run(next.fn, next.resolve, next.reject); }
+    });
+  }
+  return function(fn){
+    return new Promise(function(resolve, reject){
+      if (active < max) run(fn, resolve, reject);
+      else queue.push({ fn:fn, resolve:resolve, reject:reject });
+    });
+  };
+}
+
+// ---------- Exact object probe ----------
+function generateCandidates(requestedKey){
+  var base = stripExt(requestedKey);
+  var e = extLower(requestedKey);
+  var cand = [ requestedKey ];
+  if (e === 'tif' || e === 'tiff') {
+    cand.push(base + '.tif', base + '.tiff', base + '.TIF', base + '.TIFF', base + '.pdf', base + '.PDF');
+  } else if (e === 'pdf') {
+    cand.push(base + '.pdf', base + '.PDF', base + '.tif', base + '.tiff', base + '.TIF', base + '.TIFF');
+  } else {
+    cand.push(base + '.tif', base + '.tiff', base + '.TIF', base + '.TIFF', base + '.pdf', base + '.PDF');
+  }
+  return unique(cand);
+}
+function headOk(url){ return fetch(url, { method:'HEAD' }).then(function(r){ return r.ok; }).catch(function(){ return false; }); }
+async function resolveObjectKey(requestedKey){
+  var list = generateCandidates(requestedKey);
+  for (var i=0;i<list.length;i++){
+    var k=list[i];
+    var ok = await headOk(s3Base + '/' + encKey(k));
+    if (ok) return { key:k, tried:list.slice(0, i+1) };
+  }
+  return { key:null, tried:list };
+}
+
+// ---------- Search utils ----------
+function scoreMatch(bare, qBare){
+  if (bare === qBare) return 0;             // exact
+  if (bare.indexOf(qBare) === 0) return 1;  // prefix
+  if (bare.indexOf(qBare) >= 0) return 2;   // contains
+  return 99;
+}
+function setProgress(el, text){ if (el) el.textContent = text; }
+
+// Phase 4: whole-bucket streaming search (prefix = ZIP 4/)
+async function searchWholeBucket(qBare, limit, progressEl){
+  var results = [];
+  var token = null, scanned = 0, page = 0;
+  while (true){
+    page++;
+    var url = s3Base + '/?list-type=2&prefix=' + encodeURIComponent('ZIP 4/');
+    if (token) url += '&continuation-token=' + encodeURIComponent(token);
+    var r = await fetch(url);
+    if (!r.ok) throw new Error('HTTP ' + r.status + ' listing whole bucket');
+    var xml = parseXML(await r.text());
+
+    var cont = xml.getElementsByTagName('Contents');
+    for (var j=0;j<cont.length;j++){
+      var k = getText(cont[j],'Key');
+      if (k && k.slice(-1) !== '/'){
+        scanned++;
+        var bare = stripExt(filenameFromKey(k)).toLowerCase();
+        var s = scoreMatch(bare, qBare);
+        if (s !== 99){
+          results.push({ type:'file', key:k, size:getText(cont[j],'Size'), lastmod:getText(cont[j],'LastModified'), score:s });
+          if (results.length >= limit) break;
+        }
+      }
+    }
+    setProgress(progressEl, 'Phase 3: whole-bucket scan… pages=' + page + ', scanned=' + scanned + ', matches=' + results.length);
+    if (results.length >= limit) break;
+
+    if (getText(xml,'IsTruncated') !== 'true') break;
+    token = getText(xml,'NextContinuationToken');
+    if (!token) break;
+  }
+  return results;
+}
+
+// ---------- Global search with phased fallbacks ----------
+async function searchBucket(query, opts){
+  opts = opts || {};
+  var limitResults = opts.limit || 150;
+  var progressEl = opts.progressEl || document.getElementById('searchProgress');
+  var results = []; // {type:'folder'|'file', key, size?, lastmod?, score}
+
+  var qRaw = String(query||'').trim();
+  var qBare = stripExt(qRaw).toLowerCase();
+  if (!qBare) return results;
+
+  var fileLike = /[-_]\d+/.test(qBare);          // e.g., k3235-012
+  var drawingToken = looksLikeDrawingToken(qBare); // e.g., k3235
+  var scanToken = drawingToken || qBare;
+
+  // prepare folders
+  setProgress(progressEl, 'Preparing search…');
+  var cities = (await listAllCached('ZIP 4/', '/')).prefixes;
+  var categories = ['Water/','WasteWater/'];
+
+  var targetedFolders = []; // token-matching folders (phase 1)
+  var allFolders = [];      // all drawing folders (phase 2)
+  var seen = {};
+
+  for (var c=0;c<cities.length;c++){
+    for (var cat=0; cat<categories.length; cat++){
+      var root = cities[c] + categories[cat];
+      var list = await listAllCached(root, '/');
+      // all folders
+      for (var i=0;i<list.prefixes.length;i++){
+        var f = list.prefixes[i];
+        if (!seen[f]){ seen[f] = 1; allFolders.push(f); }
+      }
+      // token-matching folders
+      if (drawingToken){
+        for (var j=0;j<list.prefixes.length;j++){
+          var p = list.prefixes[j];
+          if (p.toLowerCase().indexOf(drawingToken) !== -1){
+            targetedFolders.push(p);
+          }
+        }
+      }
+    }
+  }
+
+  // helper: deep scan a set of folders (concurrency-limited)
+  async function deepScanFolders(folders, phaseLabel){
+    if (!folders.length) return [];
+    setProgress(progressEl, phaseLabel + ' scanning ' + folders.length + ' folders…');
+    var lim = pLimit(6); // up to 6 list requests at once
+    var out = [];
+    var stop = false;
+
+    var tasks = folders.map(function(folder){
+      return lim(async function(){
+        if (stop) return;
+        var files = await listAllCached(folder, null);
+        // match by basename
+        for (var k=0; k<files.objects.length; k++){
+          var o = files.objects[k];
+          var bare = stripExt(filenameFromKey(o.key)).toLowerCase();
+          var s = scoreMatch(bare, qBare);
+          if (s !== 99){
+            out.push({ type:'file', key:o.key, size:o.size, lastmod:o.lastmod, score:s });
+            if (out.length >= limitResults){ stop = true; break; }
+          }
+        }
+      });
+    });
+
+    await Promise.all(tasks);
+    return out;
+  }
+
+  // ---- Phase 1: targeted (by drawing token) ----
+  // (If query doesn't produce a token, we skip to Phase 2.)
+  if (targetedFolders.length){
+    var hits1 = await deepScanFolders(targetedFolders, 'Phase 1: targeted folders');
+    results = results.concat(hits1);
+  }
+
+  // ---- Phase 2: broaden to ALL drawing folders ----
+  if (results.length === 0){
+    var hits2 = await deepScanFolders(allFolders, 'Phase 2: broadened folders');
+    results = results.concat(hits2);
+  }
+
+  // ---- Phase 3: whole-bucket (ZIP 4/) streaming ----
+  if (results.length === 0){
+    setProgress(progressEl, 'Phase 3: whole-bucket scan…');
+    var hits3 = await searchWholeBucket(qBare, limitResults, progressEl);
+    results = results.concat(hits3);
+  }
+
+  // sort & return
+  results.sort(function(a,b){
+    if (a.score !== b.score) return a.score - b.score;
+    return a.key < b.key ? -1 : (a.key > b.key ? 1 : 0);
+  });
+  setProgress(progressEl, 'Done. Matches: ' + results.length);
+  return results;
+}
+
+// ---------- Render search UI ----------
+function renderSearchUI(initial, opts){
+  opts = opts || {};
+  var q = initial || '';
+  app.innerHTML =
+    '<div class="card">'+
+      '<div class="toolbar">'+
+        '<div class="muted">Search entire bucket (matches by file name without extension)</div>'+
+        '<input id="searchInput" class="input" type="text" placeholder="K602, K992-069, filename" value="'+q+'">'+
+        '<button id="searchBtn" class="btn" type="button">Search</button>'+
+      '</div>'+
+      '<div id="searchProgress" class="muted small" style="padding:4px 0 8px 0;"></div>'+
+      '<div id="searchResults">Enter a term and press Search.</div>'+
+    '</div>';
+
+  document.getElementById('searchBtn').onclick = doSearch;
+  document.getElementById('searchInput').onkeydown = function(e){ if(e.key==='Enter') doSearch(); };
+
+  if (q && opts.autorun){ setTimeout(doSearch, 0); }
+
+  async function doSearch(){
+    var term = document.getElementById('searchInput').value.trim();
+    if (!term){ return; }
+    var progressEl = document.getElementById('searchProgress');
+    setProgress(progressEl, 'Starting…');
+
+    var results = [];
+    try {
+      results = await searchBucket(term, { limit: 300, progressEl: progressEl });
+    } catch (e) {
+      document.getElementById('searchResults').innerHTML = '<div class="error">Search failed: '+String(e)+'</div>';
+      setProgress(progressEl, '');
+      return;
+    }
+
+    if (!results.length){
+      document.getElementById('searchResults').innerHTML = '<div>No matches.</div>';
+      return;
+    }
+
+    var html = '';
+    for (var i=0;i<results.length;i++){
+      var r = results[i];
+      // only files are returned by phases; folders may appear if you add them later
+      var ext = r.key.toLowerCase().split('.').pop();
+      var viewer = (ext==='tif'||ext==='tiff'||ext==='pdf') ? ('?view='+encodeURIComponent(r.key)) : (s3Base+'/'+encKey(r.key));
+      var sizeStr = r.size ? humanSize(r.size) : '';
+      var lmStr = r.lastmod ? (' • ' + new Date(r.lastmod).toLocaleString()) : '';
+      html += '<div class="card"><div><a href="'+viewer+'">'+r.key+'</a></div>'+
+              '<div class="muted">'+sizeStr+lmStr+'</div></div>';
+    }
+    document.getElementById('searchResults').innerHTML = '<div class="grid">'+html+'</div>';
+  }
+}
+
+// ---------- UI boot ----------
+var app = document.getElementById('app');
+var bucketInfo = document.getElementById('bucketInfo');
+bucketInfo.textContent = BUCKET + ' (' + REGION + ')';
+
+// Header search
+document.getElementById('searchBtnTop').onclick = function(){
+  var term = document.getElementById('searchInputTop').value.trim();
+  renderSearchUI(term, { autorun: true });
+};
+
+if (viewKey){ renderViewer(viewKey); } else { renderLister(prefix); }
+
+// ---------- Listing ----------
+function renderLister(pfx){
+  app.innerHTML =
+    '<div class="crumbs">'+crumbsHTML()+'</div>'+
+    '<div class="card"><div class="toolbar"><span class="muted">Listing prefix:</span> '+
+    '<code class="mono">'+(pfx||'/')+'</code>'+
+    '<span style="flex:1 1 auto"></span>'+
+    '<button class="btn" id="openSearch" type="button">Search bucket</button>'+
+    '</div><div id="listing">Loading…</div></div>';
+
+  document.getElementById('openSearch').onclick = function(){ renderSearchUI(''); };
+
+  var url = s3Base+'/?list-type=2&delimiter=/&prefix='+encodeURIComponent(pfx);
+  fetch(url).then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.text(); })
+  .then(function(xmlText){
+    var doc = parseXML(xmlText);
+
+    var cpNodes = doc.getElementsByTagName('CommonPrefixes'), prefixes=[];
+    for(var i=0;i<cpNodes.length;i++){ var n=cpNodes[i].getElementsByTagName('Prefix')[0]; if(n) prefixes.push(n.textContent); }
+
+    var cNodes = doc.getElementsByTagName('Contents'), objects=[];
+    for(var j=0;j<cNodes.length;j++){
+      var k=cNodes[j].getElementsByTagName('Key')[0]; if(!k) continue;
+      var s=cNodes[j].getElementsByTagName('Size')[0];
+      var lm=cNodes[j].getElementsByTagName('LastModified')[0];
+      var key=k.textContent; if(key.slice(-1) !== '/'){ objects.push({key:key,size:s?s.textContent:'0',lastmod:lm?lm.textContent:''}); }
+    }
+
+    // Auto-search if folder is empty
+    if(prefixes.length===0 && objects.length===0){
+      var term = suggestFromPrefix(pfx); // e.g., "K602"
+      var top = document.getElementById('searchInputTop');
+      if (top){ top.value = term; }
+      renderSearchUI(term, { autorun: true });
+      return;
+    }
+
+    var listing=document.getElementById('listing');
+    var folderHTML='', fileHTML='';
+    for(var f=0; f<prefixes.length; f++){
+      var p=prefixes[f], name=trimTrailingSlash(p).slice(pfx.length);
+      folderHTML+= '<div class="card"><div class="folder"><a href="?prefix='+encodeURIComponent(p)+'">[folder] '+name+
+                   '</a></div><div class="muted">prefix</div></div>';
+    }
+    for(var g=0; g<objects.length; g++){
+      var o=objects[g], name2=o.key.slice(pfx.length);
+      var ext = name2.toLowerCase().split('.').pop();
+      var viewable = (ext==='pdf'||ext==='tif'||ext==='tiff');
+      var href = viewable ? ('?view='+encodeURIComponent(o.key)) : (s3Base+'/'+encKey(o.key));
+      var sizeStr2 = humanSize(o.size);
+      var lmStr2 = o.lastmod ? (new Date(o.lastmod).toLocaleString()) : '';
+      if (lmStr2) lmStr2 = ' • ' + lmStr2;
+      fileHTML+= '<div class="card"><div><a href="'+href+'">'+name2+'</a></div>'+
+                 '<div class="muted">'+sizeStr2+lmStr2+'</div></div>';
+    }
+    listing.innerHTML = '<div class="grid">'+folderHTML+fileHTML+'</div>';
+  })
+  .catch(function(err){
+    document.getElementById('listing').innerHTML = '<div class="error">Failed to list: '+String(err)+'</div>';
+  });
+}
+
+// ---------- Viewer ----------
+async function renderViewer(requestedKey){
+  var resolved = await resolveObjectKey(requestedKey);
+  var key = resolved.key;
+
+  if (!key) {
+    // Prefer full basename (e.g., K3235-012) over drawing token (K3235)
+    var base = stripExt(filenameFromKey(requestedKey));
+    var token = looksLikeDrawingToken(base);
+    var suggested = base;
+    if (token && token.length === base.length){ suggested = token; }
+    var topInput = document.getElementById('searchInputTop');
+    if (topInput){ topInput.value = suggested; topInput.focus(); }
+    renderSearchUI(suggested, { autorun: true });
+    return;
+  }
+
+  var name = filenameFromKey(key);
+  var ext  = name.toLowerCase().split('.').pop();
+  var objectUrl = s3Base + '/' + encKey(key);
+  var parent = parentPrefixOfKey(key);
+
+  app.innerHTML =
+    '<div class="crumbs">'+crumbsHTML()+'</div>'+
+    '<div class="toolbar">'+
+      '<a class="btn" href="?prefix='+encodeURIComponent(parent)+'">← Folder</a>'+
+      '<a class="btn" target="_blank" href="'+objectUrl+'">Open raw</a>'+
+      '<a class="btn" id="dlBtn" href="'+objectUrl+'" download>File</a>'+
+      '<span class="muted mono">'+key+'</span>'+
+    '</div>'+
+    '<div id="viewerWrap" class="card"></div>';
+
+  if (key !== requestedKey) {
+    var note = document.createElement('div');
+    note.className = 'note';
+    note.textContent = 'Showing "' + name + '" (auto fallback from requested file).';
+    app.querySelector('.toolbar').after(note);
+  }
+
+  document.getElementById('dlBtn').addEventListener('click', function(e){
+    e.preventDefault();
+    fetch(objectUrl).then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+      .then(function(blob){
+        var a=document.createElement('a'); var u=URL.createObjectURL(blob);
+        a.href=u; a.download=name; document.body.appendChild(a); a.click(); a.remove();
+        setTimeout(function(){ URL.revokeObjectURL(u); }, 2000);
+      }).catch(function(err){ alert('Download failed: ' + String(err)); });
+  });
+
+  var wrap=document.getElementById('viewerWrap');
+
+  if (ext === 'pdf'){
+    var iframe=document.createElement('iframe'); iframe.className='viewer'; wrap.appendChild(iframe);
+    fetch(objectUrl).then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.blob(); })
+      .then(function(b){
+        var u=URL.createObjectURL(b);
+        iframe.src=u+'#toolbar=1&navpanes=0';
+        iframe.onload=function(){ setTimeout(function(){ URL.revokeObjectURL(u); }, 1000); };
+      })
+      .catch(function(err){ wrap.innerHTML='<div class="card error">Failed to load PDF: ' + String(err) + '</div>'; });
+    return;
+  }
+
+  if (ext === 'tif' || ext === 'tiff'){
+    var canvas=document.createElement('canvas'); canvas.className='viewer'; wrap.appendChild(canvas);
+    if (!window.UTIF || typeof UTIF.decode !== 'function'){
+      wrap.innerHTML='<div class="card error">TIFF viewer library not loaded.</div>'; return;
+    }
+
+    fetch(objectUrl).then(function(r){ if(!r.ok) throw new Error('HTTP ' + r.status); return r.arrayBuffer(); })
+    .then(function(buf){
+      var ifds = UTIF.decode(buf);
+      if (!ifds || !ifds.length) throw new Error('No pages (IFDs) found');
+      var page = ifds[0];
+
+      var w = Number(page.width), h = Number(page.height);
+      if(!isFinite(w) || !isFinite(h) || w<=0 || h<=0){
+        if (typeof UTIF.decodeImage === 'function'){ UTIF.decodeImage(buf, page); }
+        else if (typeof UTIF.decodeImages === 'function'){ UTIF.decodeImages(buf, ifds); }
+        w = Number(page.width) || Number(page.t256 || (page.ImageWidth||[])[0]);
+        h = Number(page.height) || Number(page.t257 || (page.ImageLength||[])[0]);
+      }
+      if(!isFinite(w) || !isFinite(h) || w<=0 || h<=0){ throw new Error('Invalid TIFF dimensions'); }
+
+      var comp = page.t259 || page.Compression;
+      var area = w*h;
+
+      var info=document.createElement('div');
+      info.className='muted'; info.style.padding='6px 0 8px 0';
+      info.textContent='TIFF ' + w + 'x' + h + ' • compression=' + comp + ' • preview only';
+      wrap.insertBefore(info, canvas);
+
+      if (area > HARD_PIXEL_LIMIT){
+        wrap.innerHTML =
+          '<div class="card error">This TIFF is too large to preview (' +
+          w + '×' + h + ' ≈ ' + Math.round(area/1e6) + ' MP). Use the File button to download and open locally.</div>';
+        return;
+      }
+
+      if (typeof UTIF.decodeImage === 'function'){ UTIF.decodeImage(buf, page); }
+      else if (typeof UTIF.decodeImages === 'function'){ UTIF.decodeImages(buf, ifds); }
+
+      var rgba = UTIF.toRGBA8(page);
+      if (!rgba || !rgba.length) throw new Error('Empty pixel data');
+
+      var scale = Math.max(1, Math.sqrt((w*h) / TARGET_PREVIEW_PIXELS));
+      var targetW = Math.max(1, Math.floor(w / scale));
+      var targetH = Math.max(1, Math.floor(h / scale));
+
+      var small=document.createElement('canvas');
+      small.width=targetW; small.height=targetH;
+      var sctx=small.getContext('2d');
+      var img=sctx.createImageData(targetW, targetH);
+
+      var SW=w, SH=h;
+      for (var y=0; y<targetH; y++){
+        var sy=Math.floor(y*SH/targetH);
+        for (var x=0; x<targetW; x++){
+          var sx=Math.floor(x*SW/targetW);
+          var si=(sy*SW+sx)*4;
+          var di=(y*targetW+x)*4;
+          img.data[di]=rgba[si];
+          img.data[di+1]=rgba[si+1];
+          img.data[di+2]=rgba[si+2];
+          img.data[di+3]=rgba[si+3];
+        }
+      }
+      sctx.putImageData(img,0,0);
+
+      canvas.width=targetW; canvas.height=targetH;
+      var ctx=canvas.getContext('2d');
+      ctx.imageSmoothingEnabled=false;
+      ctx.drawImage(small,0,0);
+    })
+    .catch(function(err){
+      wrap.innerHTML = '<div class="card error">Failed to render TIFF: ' + String(err) + '</div>';
+    });
+    return;
+  }
+
+  wrap.innerHTML = '<div class="card">Unsupported preview. <a class="btn" target="_blank" href="'+objectUrl+'">Open</a></div>';
+}
+</script>
+</body>
+</html>

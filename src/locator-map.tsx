@@ -49,42 +49,285 @@ interface DrawEvent {
 // === YOUR GEOserver WMS base URL (no query params beyond '?') ===
 const WMS_URL = "http://35.183.38.140/geoserver/ows?";
 
+// === S3 BUCKET CONFIGURATION (for drawing links) ===
+const S3_BASE = "https://ticketviewgis.s3.ca-central-1.amazonaws.com";
+const ZIP_SEGMENT = "ZIP 4";
+const EXT_ORDER = [".TIF", ".PDF"]; // prefer TIF; can be changed to prefer PDF
+
+// === DRAWING LINK HELPER FUNCTIONS (based on content.ftl logic) ===
+
+// Encode a single path segment (not slashes)
+function encodeSegment(s: string): string {
+  if (!s) return "";
+  return s
+    .trim()
+    .replace(/%/g, "%25")
+    .replace(/&/g, "%26")
+    .replace(/\+/g, "%2B")
+    .replace(/#/g, "%23")
+    .replace(/\s/g, "%20");
+}
+
+// Convert path to query param value where / -> %2F
+function pathToQueryParam(path: string): string {
+  if (!path) return "";
+  return path.replace(/\//g, "%2F");
+}
+
+// Normalize ID: uppercase, remove extension, replace spaces/underscores with hyphen
+function normalizeId(raw: string): string {
+  if (!raw) return "";
+  const upper = raw.toUpperCase();
+  const noext = upper.replace(/\..*$/, "");
+  return noext.replace(/[ _]+/g, "-");
+}
+
+// Check if ID has hyphen
+function hasHyphen(s: string): boolean {
+  return s.includes("-");
+}
+
+// Determine folder name from normalized ID
+function folderFromId(normId: string): string {
+  if (!normId) return "";
+  if (hasHyphen(normId)) {
+    const before = normId.split("-")[0];
+    return before || (normId.length >= 6 ? normId.substring(0, 6) : "");
+  }
+  return normId;
+}
+
+// Derive ID from DataSource (e.g., BR2405_03 -> BR2405-003)
+function deriveIdFromDataSource(dataSource: string): string {
+  if (!dataSource) return "";
+  const ds = dataSource.toUpperCase().trim();
+
+  // Base + suffix (1-3 digits)
+  const withSuffixMatch = ds.match(/([A-Z]{1,3}\d{3,5})[-_ ]?(\d{1,3})/);
+  if (withSuffixMatch) {
+    const base = withSuffixMatch[1];
+    const suffix = withSuffixMatch[2];
+    const suffix3 = suffix.padStart(3, "0");
+    return `${base}-${suffix3}`;
+  }
+
+  // Base only
+  const baseMatch = ds.match(/[A-Z]{1,3}\d{3,5}/);
+  if (baseMatch) {
+    return baseMatch[0];
+  }
+
+  return "";
+}
+
+// Zero-pad suffix to 3 digits (used only when derived from DataSource)
+function padSuffix3(id: string): string {
+  const match = id.match(/^([A-Z]{1,3}\d{3,5})-(\d{1,3})$/);
+  if (match) {
+    const base = match[1];
+    const suffix = match[2].padStart(3, "0");
+    return `${base}-${suffix}`;
+  }
+  return id;
+}
+
+// Determine utility folder from RegionalDivision field
+function canonicalUtilFromRegionalDivision(rd: string): string {
+  const upper = (rd || "").toUpperCase();
+  if (
+    upper.startsWith("WASTE") ||
+    upper.startsWith("SANIT") ||
+    upper.startsWith("SEWER")
+  ) {
+    return "WasteWater";
+  }
+  if (upper.startsWith("STORM") || upper.startsWith("DRAIN")) {
+    return "Storm";
+  }
+  if (upper.startsWith("WATER")) {
+    return "Water";
+  }
+  return "";
+}
+
+// Determine utility folder from layer name
+function canonicalUtilFromLayer(layerName: string): string {
+  const ln = (layerName || "").toUpperCase();
+  if (ln.includes("RWWN")) return "WasteWater";
+  if (ln.includes("RSW")) return "Storm";
+  if (ln.includes("RWN") || ln.includes("WATER")) return "Water";
+  return "Water"; // default
+}
+
+// Choose utility folder (prefer feature attribute, fallback to layer name)
+function chooseUtilityFolder(layerName: string, properties: any): string {
+  const fromFeature = canonicalUtilFromRegionalDivision(
+    properties.RegionalDivision || ""
+  );
+  if (fromFeature) return fromFeature;
+  return canonicalUtilFromLayer(layerName);
+}
+
+// Get area from Settlement or Municipality
+function getArea(properties: any): string {
+  const settlement = properties.Settlement || "";
+  const municipality = properties.Municipality || "";
+  return settlement || municipality || "Region-Wide";
+}
+
+// Generate viewer URL for a feature
+function generateViewerUrl(layerName: string, properties: any): string {
+  // Choose raw ID: AsBuiltNumber > DrawingNumber > derived from DataSource
+  const rawA = properties.AsBuiltNumber || "";
+  const rawD = properties.DrawingNumber || "";
+  let rawS = "";
+  if (!rawA && !rawD) {
+    rawS = deriveIdFromDataSource(properties.DataSource || "");
+  }
+  const raw = rawA || rawD || rawS;
+  if (!raw) return "";
+
+  // Normalize; only pad when derived from DataSource
+  const fromDS = !rawA && !rawD && rawS;
+  let norm = normalizeId(raw);
+  if (fromDS) {
+    norm = padSuffix3(norm);
+  }
+
+  const util = chooseUtilityFolder(layerName, properties);
+  const area = getArea(properties);
+  const idDir = folderFromId(norm);
+  const basePath = `${encodeSegment(ZIP_SEGMENT)}/${encodeSegment(
+    area
+  )}/${util}/${encodeSegment(idDir)}`;
+
+  if (hasHyphen(norm)) {
+    // File link (with hyphen, e.g., K602-001)
+    const ext = EXT_ORDER[0];
+    const fullPath = `${basePath}/${encodeSegment(norm)}${ext}`;
+    return `${S3_BASE}/index.html?view=${pathToQueryParam(fullPath)}`;
+  } else {
+    // Folder link (no hyphen, e.g., K602)
+    const fullPrefix = `${basePath}/`;
+    return `${S3_BASE}/index.html?prefix=${pathToQueryParam(fullPrefix)}`;
+  }
+}
+
+// Determine which field was used for the drawing ID
+function getDrawingIdInfo(properties: any): { label: string; value: string } {
+  const rawA = properties.AsBuiltNumber || "";
+  const rawD = properties.DrawingNumber || "";
+
+  if (rawA) {
+    return { label: "AsBuiltNumber", value: normalizeId(rawA) };
+  }
+  if (rawD) {
+    return { label: "DrawingNumber", value: normalizeId(rawD) };
+  }
+
+  const rawS = deriveIdFromDataSource(properties.DataSource || "");
+  if (rawS) {
+    return { label: "DataSource", value: padSuffix3(normalizeId(rawS)) };
+  }
+
+  return { label: "", value: "" };
+}
+
+// === Layer Styling Configuration ===
+// Define consistent colors for different infrastructure types
+const LAYER_STYLES = {
+  // General Infrastructure - neutral colors
+  general: { color: "#64748b", opacity: 0.7 }, // slate gray
+
+  // Storm Water - cool gray/blue tones
+  storm: { color: "#6b7280", opacity: 0.75 }, // gray for mains/lines
+  stormPoint: { color: "#64748b", opacity: 0.8 }, // slightly lighter for points
+
+  // Water Network - blue tones
+  water: { color: "#2563eb", opacity: 0.8 }, // bright blue for mains
+  waterPoint: { color: "#3b82f6", opacity: 0.85 }, // lighter blue for points
+
+  // Wastewater - brown/amber tones
+  wastewater: { color: "#92400e", opacity: 0.75 }, // dark brown for mains
+  wastewaterPoint: { color: "#b45309", opacity: 0.8 }, // lighter brown for points
+};
+
 // === Configure the layers you want to expose (use exact <Name> from GetCapabilities) ===
 const LAYERS = [
   // General Infrastructure
-  { key: "waterloo:Roads", title: "Roads" },
-  { key: "waterloo:Addresses", title: "Addresses" },
-  { key: "waterloo:Boundary_RMW", title: "RMW Boundary" },
-  { key: "waterloo:CityTownVillage", title: "City/Town/Village" },
+  { key: "waterloo:Roads", title: "Roads", style: "general" },
+  { key: "waterloo:Addresses", title: "Addresses", style: "general" },
+  { key: "waterloo:Boundary_RMW", title: "RMW Boundary", style: "general" },
+  {
+    key: "waterloo:CityTownVillage",
+    title: "City/Town/Village",
+    style: "general",
+  },
 
-  // Storm Water System (RSW)
-  { key: "waterloo:RSW_Mains", title: "Storm Mains" },
-  { key: "waterloo:RSW_Manholes", title: "Storm Manholes" },
-  { key: "waterloo:RSW_Catchbasins", title: "Storm Catchbasins" },
-  { key: "waterloo:RSW_Ceptors", title: "Storm Ceptors" },
-  { key: "waterloo:RSW_Culverts", title: "Storm Culverts" },
-  { key: "waterloo:RSW_Ditches", title: "Storm Ditches" },
-  { key: "waterloo:RSW_Inlets", title: "Storm Inlets" },
-  { key: "waterloo:RSW_Leads", title: "Storm Leads" },
-  { key: "waterloo:RSW_Outlets", title: "Storm Outlets" },
-  { key: "waterloo:RSW_Ponds", title: "Storm Ponds" },
-  { key: "waterloo:RSW_Subdrains", title: "Storm Subdrains" },
+  // Storm Water System (RSW) - gray tones
+  { key: "waterloo:RSW_Mains", title: "Storm Mains", style: "storm" },
+  {
+    key: "waterloo:RSW_Manholes",
+    title: "Storm Manholes",
+    style: "stormPoint",
+  },
+  {
+    key: "waterloo:RSW_Catchbasins",
+    title: "Storm Catchbasins",
+    style: "stormPoint",
+  },
+  { key: "waterloo:RSW_Ceptors", title: "Storm Ceptors", style: "stormPoint" },
+  { key: "waterloo:RSW_Culverts", title: "Storm Culverts", style: "storm" },
+  { key: "waterloo:RSW_Ditches", title: "Storm Ditches", style: "storm" },
+  { key: "waterloo:RSW_Inlets", title: "Storm Inlets", style: "stormPoint" },
+  { key: "waterloo:RSW_Leads", title: "Storm Leads", style: "storm" },
+  { key: "waterloo:RSW_Outlets", title: "Storm Outlets", style: "stormPoint" },
+  { key: "waterloo:RSW_Ponds", title: "Storm Ponds", style: "stormPoint" },
+  { key: "waterloo:RSW_Subdrains", title: "Storm Subdrains", style: "storm" },
 
-  // Water Network (RWN)
-  { key: "waterloo:Water_Mains", title: "Water Mains" },
-  { key: "waterloo:RWN_Mains", title: "Water Network Mains" },
-  { key: "waterloo:RWN_Hydrants", title: "Fire Hydrants" },
-  { key: "waterloo:RWN_Chambers", title: "Water Chambers" },
-  { key: "waterloo:RWN_Junctions", title: "Water Junctions" },
-  { key: "waterloo:RWN_ServiceValves", title: "Water Service Valves" },
-  { key: "waterloo:RWN_Services", title: "Water Services" },
-  { key: "waterloo:RWN_Valves", title: "Water Valves" },
-  { key: "waterloo:Water_Services", title: "Water Services (Alt)" },
+  // Water Network (RWN) - blue tones
+  { key: "waterloo:Water_Mains", title: "Water Mains", style: "water" },
+  { key: "waterloo:RWN_Mains", title: "Water Network Mains", style: "water" },
+  { key: "waterloo:RWN_Hydrants", title: "Fire Hydrants", style: "waterPoint" },
+  {
+    key: "waterloo:RWN_Chambers",
+    title: "Water Chambers",
+    style: "waterPoint",
+  },
+  {
+    key: "waterloo:RWN_Junctions",
+    title: "Water Junctions",
+    style: "waterPoint",
+  },
+  {
+    key: "waterloo:RWN_ServiceValves",
+    title: "Water Service Valves",
+    style: "waterPoint",
+  },
+  { key: "waterloo:RWN_Services", title: "Water Services", style: "water" },
+  { key: "waterloo:RWN_Valves", title: "Water Valves", style: "waterPoint" },
+  {
+    key: "waterloo:Water_Services",
+    title: "Water Services (Alt)",
+    style: "water",
+  },
 
-  // Wastewater Network (RWWN)
-  { key: "waterloo:RWWN_Mains", title: "Wastewater Mains" },
-  { key: "waterloo:RWWN_LateralLines", title: "Wastewater Lateral Lines" },
-  { key: "waterloo:RWWN_Manholes", title: "Wastewater Manholes" },
+  // Wastewater Network (RWWN) - brown tones
+  {
+    key: "waterloo:RWWN_Mains",
+    title: "Wastewater Mains",
+    style: "wastewater",
+  },
+  {
+    key: "waterloo:RWWN_LateralLines",
+    title: "Wastewater Lateral Lines",
+    style: "wastewater",
+  },
+  {
+    key: "waterloo:RWWN_Manholes",
+    title: "Wastewater Manholes",
+    style: "wastewaterPoint",
+  },
 ] as const;
 
 // Function to fetch available layers from GetCapabilities
@@ -331,28 +574,130 @@ function DrawControl() {
     const drawEvents = (L as unknown as { Draw: { Event: LeafletDrawEvents } })
       .Draw.Event;
 
+    // Load saved drawings from localStorage on mount
+    try {
+      const saved = localStorage.getItem("wms-drawings");
+      if (saved) {
+        const geojson = JSON.parse(saved);
+        L.geoJSON(geojson, {
+          onEachFeature: (_feature, layer) => {
+            drawnItems.addLayer(layer);
+          },
+        });
+      }
+    } catch (error) {
+      console.error("Error loading saved drawings:", error);
+    }
+
+    function saveDrawings() {
+      const geojson = drawnItems.toGeoJSON();
+      localStorage.setItem("wms-drawings", JSON.stringify(geojson));
+      console.log("Drawings saved to localStorage");
+    }
+
     function onCreated(e: DrawEvent) {
       drawnItems.addLayer(e.layer);
       const gj = e.layer.toGeoJSON();
       console.log("DRAWN GEOJSON:", gj);
-      // TODO: send gj to your API for storage/spatial checks if needed
+      saveDrawings(); // Auto-save on create
     }
     function onEdited(e: unknown) {
       console.log("EDITED:", e);
+      saveDrawings(); // Auto-save on edit
     }
     function onDeleted(e: unknown) {
       console.log("DELETED:", e);
+      saveDrawings(); // Auto-save on delete
     }
 
     map.on(drawEvents.CREATED, onCreated);
     map.on(drawEvents.EDITED, onEdited);
     map.on(drawEvents.DELETED, onDeleted);
 
+    // Create export/clear controls
+    const exportControl = L.Control.extend({
+      options: { position: "topleft" },
+      onAdd: function () {
+        const container = L.DomUtil.create(
+          "div",
+          "leaflet-bar leaflet-control"
+        );
+        container.style.background = "white";
+        container.style.padding = "4px";
+        container.style.display = "flex";
+        container.style.flexDirection = "column";
+        container.style.gap = "4px";
+
+        // Export button
+        const exportBtn = L.DomUtil.create("button", "", container);
+        exportBtn.innerHTML = "💾 Export";
+        exportBtn.title = "Export drawings as GeoJSON";
+        exportBtn.style.padding = "4px 8px";
+        exportBtn.style.fontSize = "12px";
+        exportBtn.style.cursor = "pointer";
+        exportBtn.style.border = "none";
+        exportBtn.style.background = "#007cba";
+        exportBtn.style.color = "white";
+        exportBtn.style.borderRadius = "4px";
+        exportBtn.style.fontWeight = "600";
+
+        L.DomEvent.on(exportBtn, "click", function (e) {
+          L.DomEvent.stopPropagation(e);
+          const geojson = drawnItems.toGeoJSON();
+          const blob = new Blob([JSON.stringify(geojson, null, 2)], {
+            type: "application/json",
+          });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement("a");
+          a.href = url;
+          a.download = `wms-drawings-${
+            new Date().toISOString().split("T")[0]
+          }.geojson`;
+          document.body.appendChild(a);
+          a.click();
+          document.body.removeChild(a);
+          URL.revokeObjectURL(url);
+        });
+
+        // Clear button
+        const clearBtn = L.DomUtil.create("button", "", container);
+        clearBtn.innerHTML = "🗑️ Clear";
+        clearBtn.title = "Clear all drawings";
+        clearBtn.style.padding = "4px 8px";
+        clearBtn.style.fontSize = "12px";
+        clearBtn.style.cursor = "pointer";
+        clearBtn.style.border = "none";
+        clearBtn.style.background = "#ef4444";
+        clearBtn.style.color = "white";
+        clearBtn.style.borderRadius = "4px";
+        clearBtn.style.fontWeight = "600";
+
+        L.DomEvent.on(clearBtn, "click", function (e) {
+          L.DomEvent.stopPropagation(e);
+          if (
+            confirm(
+              "Are you sure you want to clear all drawings? This will also remove saved drawings."
+            )
+          ) {
+            drawnItems.clearLayers();
+            localStorage.removeItem("wms-drawings");
+            console.log("All drawings cleared");
+          }
+        });
+
+        return container;
+      },
+    });
+
+    const exportCtrl = new exportControl();
+    map.addControl(exportCtrl);
+
     return () => {
       map.off(drawEvents.CREATED, onCreated);
       map.off(drawEvents.EDITED, onEdited);
       map.off(drawEvents.DELETED, onDeleted);
       map.removeControl(drawControl);
+      map.removeControl(exportCtrl);
       map.removeLayer(drawnItems);
     };
   }, [map]);
@@ -425,18 +770,47 @@ function MapClickInfo({
       }
 
       try {
+        console.log(
+          `%c🔍 GETFEATUREINFO REQUEST`,
+          "color: #8b5cf6; font-weight: bold; font-size: 12px"
+        );
+        console.log(`   └─ Layers queried: ${visibleLayerKeys.join(", ")}`);
+        console.log(
+          `   └─ Click location: ${e.latlng.lat.toFixed(
+            6
+          )}, ${e.latlng.lng.toFixed(6)}`
+        );
+
         const resp = await fetch(url);
         const ct = resp.headers.get("content-type") || "";
         let html = "";
 
         if (ct.includes("application/json")) {
           const json = await resp.json();
-          console.log(json);
           const features = json.features || [];
+
+          console.log(
+            `%c📍 FEATURES FOUND: ${features.length}`,
+            features.length > 0
+              ? "color: #10b981; font-weight: bold"
+              : "color: #94a3b8; font-weight: bold"
+          );
+
+          if (features.length > 0) {
+            features.forEach((f: any, idx: number) => {
+              const layerName = f.id
+                ? f.id.split(".")[0]
+                : `Feature ${idx + 1}`;
+              console.log(`   ${idx + 1}. ${layerName}`);
+              console.log(`      └─ Properties:`, f.properties);
+            });
+          } else {
+            console.log(`   └─ No features at this location`);
+          }
           if (features.length === 0) {
             html = "<b>No features at this point.</b>";
           } else {
-            // Show all features found, not just the first one
+            // Show all features found, with drawing links
             html =
               "<div style='max-height: 600px; overflow-y: auto;'><b>Feature Info</b>";
             features.forEach((f: any, index: number) => {
@@ -444,13 +818,39 @@ function MapClickInfo({
               const layerName = f.id
                 ? f.id.split(".")[0]
                 : `Feature ${index + 1}`;
+
+              // Try to generate drawing link
+              const viewerUrl = generateViewerUrl(layerName, props);
+              const drawingInfo = getDrawingIdInfo(props);
+
               html += `<div style="margin-top:${
                 index > 0 ? "12px" : "6px"
-              };"><strong>${layerName}</strong><table style="margin-top:4px;">`;
+              }; padding: 8px; background: #f9f9f9; border-radius: 4px; border-left: 3px solid #007cba;">`;
+              html += `<strong style="color: #007cba;">${layerName}</strong>`;
+
+              // Show drawing ID and link if available
+              if (drawingInfo.value && viewerUrl) {
+                html += `<div style="margin: 6px 0; padding: 6px; background: #fff3cd; border-radius: 4px; border: 1px solid #ffc107;">`;
+                html += `<div style="font-size: 11px; color: #856404;"><strong>📄 ${drawingInfo.label}:</strong> ${drawingInfo.value}</div>`;
+                html += `<a href="${viewerUrl}" target="_blank" rel="noopener" style="
+                  display: inline-block;
+                  margin-top: 4px;
+                  padding: 4px 10px;
+                  background: #007cba;
+                  color: white;
+                  text-decoration: none;
+                  border-radius: 4px;
+                  font-size: 12px;
+                  font-weight: 600;
+                ">🔗 View Drawing</a>`;
+                html += `</div>`;
+              }
+
+              html += `<table style="margin-top:6px; width: 100%; font-size: 12px;">`;
               html += Object.entries(props)
                 .map(
                   ([k, v]) =>
-                    `<tr><td style="padding-right:8px;font-weight:600;">${k}</td><td>${String(
+                    `<tr><td style="padding: 2px 8px 2px 0; font-weight: 600; color: #555;">${k}</td><td style="padding: 2px 0;">${String(
                       v
                     )}</td></tr>`
                 )
@@ -648,8 +1048,22 @@ export default function LocatorMap() {
   function toggleLayer(key: LayerKey) {
     setVisible((prev) => {
       const next = new Set(prev);
-      if (next.has(key)) next.delete(key);
-      else next.add(key);
+
+      if (next.has(key)) {
+        next.delete(key);
+        console.log(
+          `%c⬜ LAYER DISABLED: ${key}`,
+          "color: #94a3b8; font-weight: bold"
+        );
+      } else {
+        next.add(key);
+        console.log(
+          `%c✅ LAYER ENABLED: ${key}`,
+          "color: #10b981; font-weight: bold; font-size: 13px"
+        );
+        console.log(`   └─ Watch for loading messages above...`);
+      }
+
       return next;
     });
   }
@@ -669,6 +1083,31 @@ export default function LocatorMap() {
 
   // Fetch available layers on component mount
   useEffect(() => {
+    console.log(
+      `%c🗺️ WMS MAP VIEWER INITIALIZED`,
+      "color: #0f172a; font-weight: bold; font-size: 14px; background: #fbbf24; padding: 4px 8px; border-radius: 4px"
+    );
+    console.log(
+      `%c📊 Total available layers: ${LAYERS.length}`,
+      "color: #1e40af; font-weight: bold"
+    );
+    console.log(
+      `%c🟢 Initially active layers: ${visibleLayerKeys.length}`,
+      "color: #16a34a; font-weight: bold"
+    );
+    visibleLayerKeys.forEach((key) => {
+      const layer = LAYERS.find((l) => l.key === key);
+      console.log(`   └─ ${layer?.title || key}`);
+    });
+    console.log(
+      `%c💡 TIP: Check/uncheck layers in the sidebar to see loading logs`,
+      "color: #6b7280; font-style: italic"
+    );
+    console.log(
+      `%c━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━`,
+      "color: #e5e7eb"
+    );
+
     fetchAvailableLayers().then(setAvailableLayers);
   }, []);
 
@@ -705,20 +1144,38 @@ export default function LocatorMap() {
     <div
       style={{
         display: "grid",
-        gridTemplateColumns: "320px 1fr",
+        gridTemplateColumns: "340px 1fr",
         height: "100vh",
+        background: "#f8fafc",
       }}
     >
       {/* Sidebar: layer toggles */}
       <div
-        style={{ padding: 12, borderRight: "1px solid #eee", overflow: "auto" }}
+        style={{
+          padding: 16,
+          borderRight: "1px solid #e5e7eb",
+          overflow: "auto",
+          background: "white",
+        }}
       >
-        <h3 style={{ margin: "4px 0 12px" }}>WMS Map Viewer</h3>
+        <h3 style={{ margin: "0 0 16px", color: "#0f172a" }}>
+          🗺️ WMS Map Viewer
+        </h3>
 
         {/* Search Section */}
-        <div style={{ marginBottom: 16 }}>
-          <h4 style={{ margin: "8px 0 8px", fontSize: 14 }}>🔍 Search</h4>
-          <div style={{ display: "flex", gap: 4 }}>
+        <div
+          style={{
+            marginBottom: 16,
+            padding: 12,
+            background: "#f8fafc",
+            borderRadius: 8,
+            border: "1px solid #e5e7eb",
+          }}
+        >
+          <h4 style={{ margin: "0 0 10px", fontSize: 14, color: "#1e293b" }}>
+            🔍 Search Address
+          </h4>
+          <div style={{ display: "flex", gap: 6 }}>
             <input
               type="text"
               placeholder="Search addresses..."
@@ -727,24 +1184,30 @@ export default function LocatorMap() {
               onKeyPress={(e) => e.key === "Enter" && handleSearch()}
               style={{
                 flex: 1,
-                padding: "6px 8px",
-                fontSize: 12,
-                border: "1px solid #ccc",
-                borderRadius: 4,
+                padding: "8px 10px",
+                fontSize: 13,
+                border: "1px solid #d1d5db",
+                borderRadius: 8,
+                outline: "none",
+                transition: "border-color 0.2s",
               }}
+              onFocus={(e) => (e.target.style.borderColor = "#007cba")}
+              onBlur={(e) => (e.target.style.borderColor = "#d1d5db")}
             />
             <button
               onClick={handleSearch}
               disabled={!searchTerm.trim() || isSearching}
               style={{
-                padding: "6px 12px",
-                fontSize: 12,
+                padding: "8px 14px",
+                fontSize: 13,
                 backgroundColor: "#007cba",
                 color: "white",
                 border: "none",
-                borderRadius: 4,
-                cursor: "pointer",
+                borderRadius: 8,
+                cursor:
+                  !searchTerm.trim() || isSearching ? "not-allowed" : "pointer",
                 opacity: !searchTerm.trim() || isSearching ? 0.6 : 1,
+                fontWeight: 600,
               }}
             >
               {isSearching ? "..." : "Search"}
@@ -755,11 +1218,11 @@ export default function LocatorMap() {
           {searchResults.length > 0 && (
             <div
               style={{
-                marginTop: 8,
-                maxHeight: 120,
+                marginTop: 10,
+                maxHeight: 140,
                 overflow: "auto",
-                border: "1px solid #ddd",
-                borderRadius: 4,
+                border: "1px solid #d1d5db",
+                borderRadius: 8,
                 backgroundColor: "white",
               }}
             >
@@ -768,14 +1231,15 @@ export default function LocatorMap() {
                   key={result.id}
                   onClick={() => handleResultSelect(result)}
                   style={{
-                    padding: "6px 8px",
-                    fontSize: 11,
-                    borderBottom: "1px solid #eee",
+                    padding: "8px 10px",
+                    fontSize: 12,
+                    borderBottom: "1px solid #f3f4f6",
                     cursor: "pointer",
                     backgroundColor: "white",
+                    transition: "background-color 0.15s",
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = "#f0f0f0";
+                    e.currentTarget.style.backgroundColor = "#f3f4f6";
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = "white";
@@ -791,15 +1255,16 @@ export default function LocatorMap() {
           {selectedResult && (
             <div
               style={{
-                marginTop: 8,
-                padding: 8,
-                backgroundColor: "#fff3cd",
-                borderRadius: 4,
-                fontSize: 11,
-                border: "1px solid #ffeaa7",
+                marginTop: 10,
+                padding: 10,
+                backgroundColor: "#fef3c7",
+                borderRadius: 8,
+                fontSize: 12,
+                border: "1px solid #fbbf24",
               }}
             >
-              <strong>📍 Selected:</strong> {selectedResult.address}
+              <strong style={{ color: "#92400e" }}>📍 Selected:</strong>{" "}
+              <span style={{ color: "#78350f" }}>{selectedResult.address}</span>
               <br />
               <button
                 onClick={() => {
@@ -807,14 +1272,15 @@ export default function LocatorMap() {
                   setNearbyFeatures([]);
                 }}
                 style={{
-                  marginTop: 4,
-                  padding: "2px 6px",
-                  fontSize: 10,
-                  backgroundColor: "#f39c12",
+                  marginTop: 6,
+                  padding: "4px 8px",
+                  fontSize: 11,
+                  backgroundColor: "#f59e0b",
                   color: "white",
                   border: "none",
-                  borderRadius: 2,
+                  borderRadius: 6,
                   cursor: "pointer",
+                  fontWeight: 600,
                 }}
               >
                 Clear
@@ -826,18 +1292,24 @@ export default function LocatorMap() {
           {nearbyFeatures.length > 0 && (
             <div
               style={{
-                marginTop: 8,
-                padding: 8,
-                backgroundColor: "#e8f5e8",
-                borderRadius: 4,
-                fontSize: 11,
-                maxHeight: 100,
+                marginTop: 10,
+                padding: 10,
+                backgroundColor: "#d1fae5",
+                borderRadius: 8,
+                fontSize: 12,
+                maxHeight: 120,
                 overflow: "auto",
+                border: "1px solid #6ee7b7",
               }}
             >
-              <strong>🏗️ Nearby Infrastructure:</strong>
+              <strong style={{ color: "#065f46" }}>
+                🏗️ Nearby Infrastructure:
+              </strong>
               {nearbyFeatures.map((layer) => (
-                <div key={layer.layerKey} style={{ marginTop: 4 }}>
+                <div
+                  key={layer.layerKey}
+                  style={{ marginTop: 6, color: "#047857" }}
+                >
                   <strong>{layer.layerKey.split(":")[1]}:</strong>{" "}
                   {layer.features.length} features
                 </div>
@@ -851,37 +1323,44 @@ export default function LocatorMap() {
           <div
             style={{
               marginBottom: 16,
-              padding: 8,
-              backgroundColor: "#f0f8ff",
-              borderRadius: 4,
+              padding: 12,
+              backgroundColor: "#dbeafe",
+              borderRadius: 8,
               fontSize: 12,
+              border: "1px solid #93c5fd",
             }}
           >
-            <strong>Target Location:</strong>
-            <br />
-            Lat: {urlParams.lat.toFixed(6)}
-            <br />
-            Lng: {urlParams.lng.toFixed(6)}
-            <br />
-            Radius: {urlParams.radius}m
+            <strong style={{ color: "#1e40af" }}>🎯 Target Location:</strong>
+            <div style={{ marginTop: 4, color: "#1e3a8a" }}>
+              <div>Lat: {urlParams.lat.toFixed(6)}</div>
+              <div>Lng: {urlParams.lng.toFixed(6)}</div>
+              <div>Radius: {urlParams.radius}m</div>
+            </div>
           </div>
         )}
 
-        <h4 style={{ margin: "8px 0 8px", fontSize: 14 }}>Layers</h4>
+        <h4 style={{ margin: "0 0 12px", fontSize: 14, color: "#1e293b" }}>
+          📚 Layers
+        </h4>
 
         {/* Button to show/hide available layers */}
         <button
           onClick={() => setShowAvailableLayers(!showAvailableLayers)}
           style={{
             marginBottom: 12,
-            padding: "4px 8px",
+            padding: "6px 10px",
             fontSize: 12,
-            backgroundColor: "#f0f0f0",
-            border: "1px solid #ccc",
-            borderRadius: 4,
+            backgroundColor: "#f9fafb",
+            border: "1px solid #d1d5db",
+            borderRadius: 8,
             cursor: "pointer",
+            width: "100%",
+            textAlign: "left",
+            fontWeight: 500,
+            color: "#374151",
           }}
         >
+          {showAvailableLayers ? "▼" : "▶"}{" "}
           {showAvailableLayers ? "Hide" : "Show"} Available Layers (
           {availableLayers.length})
         </button>
@@ -891,25 +1370,38 @@ export default function LocatorMap() {
           <div
             style={{
               marginBottom: 16,
-              padding: 8,
-              backgroundColor: "#f9f9f9",
-              borderRadius: 4,
+              padding: 10,
+              backgroundColor: "#f9fafb",
+              borderRadius: 8,
               fontSize: 11,
               maxHeight: 200,
               overflow: "auto",
+              border: "1px solid #e5e7eb",
             }}
           >
-            <strong>Available layers from GetCapabilities:</strong>
+            <strong style={{ color: "#374151" }}>
+              Available layers from GetCapabilities:
+            </strong>
             {availableLayers.length > 0 ? (
-              <ul style={{ margin: 0, paddingLeft: 16 }}>
+              <ul style={{ margin: "6px 0 0", paddingLeft: 20 }}>
                 {availableLayers.map((layer) => (
-                  <li key={layer} style={{ marginBottom: 2 }}>
-                    <code>{layer}</code>
+                  <li key={layer} style={{ marginBottom: 3, color: "#6b7280" }}>
+                    <code style={{ fontSize: 10, color: "#1f2937" }}>
+                      {layer}
+                    </code>
                   </li>
                 ))}
               </ul>
             ) : (
-              <p style={{ margin: 0, fontStyle: "italic" }}>Loading...</p>
+              <p
+                style={{
+                  margin: "6px 0 0",
+                  fontStyle: "italic",
+                  color: "#9ca3af",
+                }}
+              >
+                Loading...
+              </p>
             )}
           </div>
         )}
@@ -944,70 +1436,207 @@ export default function LocatorMap() {
           <div key={group.title} style={{ marginBottom: 16 }}>
             <h5
               style={{
-                margin: "8px 0 6px",
+                margin: "0 0 8px",
                 fontSize: 12,
-                fontWeight: "bold",
-                color: "#333",
-                borderBottom: "1px solid #eee",
-                paddingBottom: 2,
+                fontWeight: 600,
+                color: "#334155",
+                borderBottom: "2px solid #e5e7eb",
+                paddingBottom: 6,
               }}
             >
               {group.title}
             </h5>
-            {group.layers.map((l) => (
-              <label
-                key={l.key}
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  gap: 8,
-                  marginBottom: 6,
-                  marginLeft: 8,
-                  backgroundColor: visible.has(l.key)
-                    ? "#e8f5e8"
-                    : "transparent",
-                  padding: "2px 4px",
-                  borderRadius: "4px",
-                  fontSize: 12,
-                }}
-              >
-                <input
-                  type="checkbox"
-                  checked={visible.has(l.key)}
-                  onChange={() => toggleLayer(l.key)}
-                />
-                <span>{l.title}</span>
-                {visible.has(l.key) && (
-                  <span style={{ fontSize: 9, color: "green" }}>✓</span>
-                )}
-              </label>
-            ))}
+            {group.layers.map((l) => {
+              const styleConfig =
+                LAYER_STYLES[l.style as keyof typeof LAYER_STYLES] ||
+                LAYER_STYLES.general;
+
+              return (
+                <label
+                  key={l.key}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    marginBottom: 4,
+                    marginLeft: 4,
+                    backgroundColor: visible.has(l.key)
+                      ? "#dcfce7"
+                      : "transparent",
+                    padding: "6px 8px",
+                    borderRadius: "6px",
+                    fontSize: 12,
+                    border: visible.has(l.key)
+                      ? "1px solid #86efac"
+                      : "1px solid transparent",
+                    cursor: "pointer",
+                    transition: "all 0.15s",
+                  }}
+                  onMouseEnter={(e) => {
+                    if (!visible.has(l.key)) {
+                      e.currentTarget.style.backgroundColor = "#f8fafc";
+                      e.currentTarget.style.borderColor = "#cbd5e1";
+                    }
+                  }}
+                  onMouseLeave={(e) => {
+                    if (!visible.has(l.key)) {
+                      e.currentTarget.style.backgroundColor = "transparent";
+                      e.currentTarget.style.borderColor = "transparent";
+                    }
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={visible.has(l.key)}
+                    onChange={() => toggleLayer(l.key)}
+                    style={{ width: 16, height: 16 }}
+                  />
+                  {/* Color indicator */}
+                  <div
+                    style={{
+                      width: 12,
+                      height: 12,
+                      borderRadius: "50%",
+                      backgroundColor: styleConfig.color,
+                      border: "1px solid rgba(0,0,0,0.2)",
+                      flexShrink: 0,
+                    }}
+                    title={`Color: ${styleConfig.color}, Opacity: ${styleConfig.opacity}`}
+                  />
+                  <span style={{ flex: 1, color: "#1f2937" }}>{l.title}</span>
+                  {visible.has(l.key) && (
+                    <span style={{ fontSize: 14, color: "#16a34a" }}>✓</span>
+                  )}
+                </label>
+              );
+            })}
           </div>
         ))}
 
-        {/* Debug info */}
-        <div style={{ marginTop: 16, fontSize: 11, opacity: 0.7 }}>
-          <strong>Debug Info:</strong>
-          <br />
-          Active layers: {visibleLayerKeys.length}
-          <br />
-          Check browser console for loading errors
+        {/* Color Legend */}
+        <div
+          style={{
+            marginTop: 16,
+            padding: 10,
+            backgroundColor: "#fefce8",
+            borderRadius: 8,
+            fontSize: 11,
+            border: "1px solid #fde047",
+          }}
+        >
+          <strong style={{ color: "#713f12" }}>🎨 Color Legend</strong>
+          <div
+            style={{
+              marginTop: 6,
+              display: "flex",
+              flexDirection: "column",
+              gap: 4,
+            }}
+          >
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  backgroundColor: LAYER_STYLES.water.color,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                }}
+              />
+              <span style={{ color: "#78350f" }}>Water Network (blue)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  backgroundColor: LAYER_STYLES.storm.color,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                }}
+              />
+              <span style={{ color: "#78350f" }}>Storm Water (gray)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  backgroundColor: LAYER_STYLES.wastewater.color,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                }}
+              />
+              <span style={{ color: "#78350f" }}>Wastewater (brown)</span>
+            </div>
+            <div style={{ display: "flex", alignItems: "center", gap: 6 }}>
+              <div
+                style={{
+                  width: 10,
+                  height: 10,
+                  borderRadius: "50%",
+                  backgroundColor: LAYER_STYLES.general.color,
+                  border: "1px solid rgba(0,0,0,0.2)",
+                }}
+              />
+              <span style={{ color: "#78350f" }}>General Infrastructure</span>
+            </div>
+          </div>
         </div>
 
-        <div style={{ marginTop: 16, fontSize: 12, opacity: 0.8 }}>
-          <p>
-            <strong>Usage:</strong>
-            <br />
+        {/* Debug info */}
+        <div
+          style={{
+            marginTop: 16,
+            padding: 10,
+            backgroundColor: "#f9fafb",
+            borderRadius: 8,
+            fontSize: 11,
+            border: "1px solid #e5e7eb",
+            color: "#6b7280",
+          }}
+        >
+          <strong style={{ color: "#374151" }}>🔧 Debug Info</strong>
+          <div style={{ marginTop: 4 }}>
+            Active layers: <strong>{visibleLayerKeys.length}</strong>
+          </div>
+          <div style={{ fontSize: 10, marginTop: 2 }}>
+            Check browser console for loading errors
+          </div>
+        </div>
+
+        <div
+          style={{
+            marginTop: 16,
+            padding: 10,
+            backgroundColor: "#eff6ff",
+            borderRadius: 8,
+            fontSize: 12,
+            border: "1px solid #bfdbfe",
+            color: "#1e40af",
+          }}
+        >
+          <strong style={{ color: "#1e3a8a" }}>💡 Usage:</strong>
+          <div style={{ marginTop: 6, lineHeight: "1.6" }}>
             • Click map for feature info
             <br />• Add ?lat=43.7&lng=-79.4&radius=500 to URL for spatial
             filtering
-          </p>
+          </div>
           {spatialFilter && (
-            <p style={{ marginTop: 8, color: "#ff7800" }}>
+            <div
+              style={{
+                marginTop: 8,
+                padding: 8,
+                backgroundColor: "#fed7aa",
+                borderRadius: 6,
+                border: "1px solid #fb923c",
+                color: "#7c2d12",
+              }}
+            >
               🎯 <strong>Spatial filtering active!</strong>
               <br />
               Only showing data within {urlParams.radius}m of target.
-            </p>
+            </div>
           )}
         </div>
       </div>
@@ -1025,8 +1654,15 @@ export default function LocatorMap() {
         />
 
         {/* WMS overlays for each visible layer with spatial filtering */}
-        {LAYERS.map((l, idx) =>
-          visible.has(l.key) ? (
+        {LAYERS.map((l, idx) => {
+          if (!visible.has(l.key)) return null;
+
+          // Get style configuration for this layer
+          const styleConfig =
+            LAYER_STYLES[l.style as keyof typeof LAYER_STYLES] ||
+            LAYER_STYLES.general;
+
+          return (
             <WMSTileLayer
               key={l.key}
               url={WMS_URL}
@@ -1038,7 +1674,7 @@ export default function LocatorMap() {
               tiled={true}
               styles=""
               zIndex={200 + idx} // keep overlays above base
-              opacity={0.8} // Make layers slightly transparent so they're more visible
+              opacity={styleConfig.opacity}
               // Add spatial filtering if bounds are provided
               {...(spatialFilter && {
                 // Add CQL_FILTER for spatial filtering (if your GeoServer supports it)
@@ -1047,14 +1683,47 @@ export default function LocatorMap() {
                   : undefined,
               })}
               eventHandlers={{
-                loading: () => console.log(`Loading layer: ${l.key}`),
-                load: () => console.log(`Loaded layer: ${l.key}`),
-                tileerror: (e) =>
-                  console.error(`Error loading layer ${l.key}:`, e),
+                loading: () => {
+                  console.log(
+                    `%c🔄 LOADING: ${l.title} (${l.key})`,
+                    "color: #f59e0b; font-weight: bold"
+                  );
+                },
+                load: (e) => {
+                  console.log(
+                    `%c✅ SUCCESS: ${l.title} (${l.key})`,
+                    "color: #10b981; font-weight: bold"
+                  );
+                  console.log(`   └─ Tile URL: ${e.target._url}`);
+                  console.log(
+                    `   └─ Opacity: ${styleConfig.opacity}, Color: ${styleConfig.color}`
+                  );
+                },
+                tileerror: (e) => {
+                  console.error(
+                    `%c❌ ERROR: ${l.title} (${l.key})`,
+                    "color: #ef4444; font-weight: bold"
+                  );
+                  console.error(`   └─ Tile coords:`, e.coords);
+                  console.error(`   └─ Error:`, e.error);
+                  console.error(`   └─ Tile URL:`, e.tile?.src);
+                },
+                tileload: (e) => {
+                  console.log(
+                    `%c📦 TILE LOADED: ${l.title}`,
+                    "color: #3b82f6; font-size: 11px"
+                  );
+                  console.log(
+                    `   └─ Coords: z=${e.coords.z}, x=${e.coords.x}, y=${e.coords.y}`
+                  );
+                  console.log(
+                    `   └─ URL: ${e.tile?.src?.substring(0, 100)}...`
+                  );
+                },
               }}
             />
-          ) : null
-        )}
+          );
+        })}
 
         {/* URL-based map controller */}
         <UrlBasedMapController
