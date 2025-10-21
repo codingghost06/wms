@@ -1,5 +1,5 @@
 // src/LocatorMap.tsx
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useState, useRef } from "react";
 import {
   MapContainer,
   TileLayer,
@@ -616,27 +616,74 @@ function calculateBearing(latlng1: L.LatLng, latlng2: L.LatLng): number {
   return bearing;
 }
 
-// Format distance for display
-function formatDistance(meters: number): string {
-  if (meters < 1000) {
-    return `${meters.toFixed(2)} m`;
+// Unit conversion functions
+function metersToFeet(meters: number): number {
+  return meters * 3.28084;
+}
+
+function metersToMiles(meters: number): number {
+  return meters * 0.000621371;
+}
+
+function sqMetersToSqFeet(sqMeters: number): number {
+  return sqMeters * 10.7639;
+}
+
+function sqMetersToAcres(sqMeters: number): number {
+  return sqMeters * 0.000247105;
+}
+
+function sqMetersToHectares(sqMeters: number): number {
+  return sqMeters * 0.0001;
+}
+
+// Format distance for display based on selected unit
+function formatDistance(
+  meters: number,
+  unit: "metric" | "imperial" | "mixed"
+): string {
+  if (unit === "imperial") {
+    const feet = metersToFeet(meters);
+    if (feet < 5280) {
+      return `${feet.toFixed(2)} ft`;
+    }
+    return `${metersToMiles(meters).toFixed(2)} mi`;
+  } else if (unit === "mixed") {
+    const feet = metersToFeet(meters);
+    return `${meters.toFixed(2)} m (${feet.toFixed(2)} ft)`;
   } else {
+    // metric
+    if (meters < 1000) {
+      return `${meters.toFixed(2)} m`;
+    }
     return `${(meters / 1000).toFixed(3)} km`;
   }
 }
 
-// Format area for display
-function formatArea(squareMeters: number): string {
-  if (squareMeters < 10000) {
-    return `${squareMeters.toFixed(2)} m²`;
+// Format area for display based on selected unit
+function formatArea(
+  squareMeters: number,
+  unit: "metric" | "imperial" | "mixed"
+): string {
+  if (unit === "imperial") {
+    const sqFeet = sqMetersToSqFeet(squareMeters);
+    if (sqFeet < 43560) {
+      return `${sqFeet.toFixed(2)} ft²`;
+    }
+    return `${sqMetersToAcres(squareMeters).toFixed(2)} acres`;
+  } else if (unit === "mixed") {
+    const sqFeet = sqMetersToSqFeet(squareMeters);
+    return `${squareMeters.toFixed(2)} m² (${sqFeet.toFixed(2)} ft²)`;
   } else {
-    const hectares = squareMeters / 10000;
-    const km2 = squareMeters / 1000000;
+    // metric
+    if (squareMeters < 10000) {
+      return `${squareMeters.toFixed(2)} m²`;
+    }
+    const hectares = sqMetersToHectares(squareMeters);
     if (hectares < 100) {
       return `${hectares.toFixed(3)} ha`;
-    } else {
-      return `${km2.toFixed(3)} km²`;
     }
+    return `${(squareMeters / 1000000).toFixed(3)} km²`;
   }
 }
 
@@ -650,13 +697,128 @@ function formatBearing(degrees: number): string {
 // --- Drawing controls hooked to the raw Leaflet map instance ---
 function DrawControl({
   setIsDrawing,
+  measurementUnit,
 }: {
   setIsDrawing: (val: boolean) => void;
+  measurementUnit: "metric" | "imperial" | "mixed";
 }) {
   const map = useMap();
+  const drawnItemsRef = useRef<L.FeatureGroup | null>(null);
+  const prevUnitRef = useRef<string>(measurementUnit);
+
+  // Update measurement labels when unit changes
+  useEffect(() => {
+    if (prevUnitRef.current !== measurementUnit && drawnItemsRef.current) {
+      console.log(`🔄 Updating measurements to ${measurementUnit} units...`);
+
+      // Re-render all labels with new unit
+      const items = drawnItemsRef.current;
+      items.eachLayer((layer: any) => {
+        // Skip if it's a measurement label marker
+        if (layer.options?.icon?.options?.className?.includes("measurement")) {
+          return;
+        }
+
+        // Remove existing measurement labels for this shape
+        items.eachLayer((l: any) => {
+          if (l.options?.icon?.options?.className?.includes("measurement")) {
+            if (l._drawnBy === layer._leaflet_id) {
+              items.removeLayer(l);
+            }
+          }
+        });
+
+        // Re-add measurement labels with new unit
+        if (layer instanceof L.Polyline && !(layer instanceof L.Polygon)) {
+          // Polyline - re-add segment labels
+          const latlngs = layer.getLatLngs() as L.LatLng[];
+          for (let i = 0; i < latlngs.length - 1; i++) {
+            const midpoint = L.latLng(
+              (latlngs[i].lat + latlngs[i + 1].lat) / 2,
+              (latlngs[i].lng + latlngs[i + 1].lng) / 2
+            );
+            const distance = calculateDistance(latlngs[i], latlngs[i + 1]);
+
+            const label = L.marker(midpoint, {
+              icon: L.divIcon({
+                className: "measurement-label-marker",
+                html: `<div class="measurement-text">${formatDistance(
+                  distance,
+                  measurementUnit
+                )}</div>`,
+                iconSize: [0, 0],
+              }),
+            }) as any;
+            label._drawnBy = (layer as any)._leaflet_id;
+            items.addLayer(label);
+          }
+        } else if (layer instanceof L.Polygon || layer instanceof L.Rectangle) {
+          // Polygon/Rectangle - re-add segment and area labels
+          let latlngs: L.LatLng[];
+
+          if (layer instanceof L.Rectangle) {
+            const bounds = layer.getBounds();
+            latlngs = [
+              bounds.getSouthWest(),
+              bounds.getSouthEast(),
+              bounds.getNorthEast(),
+              bounds.getNorthWest(),
+            ];
+          } else {
+            const coords = layer.getLatLngs() as any;
+            latlngs = Array.isArray(coords[0]) ? coords[0] : coords;
+          }
+
+          // Add segment labels
+          for (let i = 0; i < latlngs.length; i++) {
+            const next = (i + 1) % latlngs.length;
+            const midpoint = L.latLng(
+              (latlngs[i].lat + latlngs[next].lat) / 2,
+              (latlngs[i].lng + latlngs[next].lng) / 2
+            );
+            const distance = calculateDistance(latlngs[i], latlngs[next]);
+
+            const label = L.marker(midpoint, {
+              icon: L.divIcon({
+                className: "measurement-label-marker",
+                html: `<div class="measurement-text">${formatDistance(
+                  distance,
+                  measurementUnit
+                )}</div>`,
+                iconSize: [0, 0],
+              }),
+            }) as any;
+            label._drawnBy = (layer as any)._leaflet_id;
+            items.addLayer(label);
+          }
+
+          // Add area label
+          const area = calculatePolygonArea(latlngs);
+          const bounds = layer.getBounds();
+          const center = bounds.getCenter();
+
+          const areaLabel = L.marker(center, {
+            icon: L.divIcon({
+              className: "measurement-area-label-marker",
+              html: `<div class="measurement-area-text">${formatArea(
+                area,
+                measurementUnit
+              )}</div>`,
+              iconSize: [0, 0],
+            }),
+          }) as any;
+          areaLabel._drawnBy = (layer as any)._leaflet_id;
+          items.addLayer(areaLabel);
+        }
+      });
+
+      prevUnitRef.current = measurementUnit;
+    }
+  }, [measurementUnit, map]);
 
   useEffect(() => {
     const drawnItems = new L.FeatureGroup();
+    drawnItemsRef.current = drawnItems;
     map.addLayer(drawnItems);
 
     const DrawControl = (L.Control as unknown as { Draw: LeafletDrawControl })
@@ -720,17 +882,21 @@ function DrawControl({
             icon: L.divIcon({
               className: "measurement-label-marker",
               html: `<div class="measurement-text">${formatDistance(
-                segmentDistance
+                segmentDistance,
+                measurementUnit
               )}</div>`,
               iconSize: [0, 0],
               iconAnchor: [0, 0],
             }),
-          });
+          }) as any;
+          label._drawnBy = (layer as any)._leaflet_id;
           label.addTo(map);
           drawnItems.addLayer(label);
         }
 
-        console.log(`📏 Line drawn: ${formatDistance(distance)}`);
+        console.log(
+          `📏 Line drawn: ${formatDistance(distance, measurementUnit)}`
+        );
         if (latlngs.length === 2) {
           const bearing = calculateBearing(latlngs[0], latlngs[1]);
           console.log(`   └─ Bearing: ${formatBearing(bearing)}`);
@@ -766,12 +932,14 @@ function DrawControl({
             icon: L.divIcon({
               className: "measurement-label-marker",
               html: `<div class="measurement-text">${formatDistance(
-                segmentDistance
+                segmentDistance,
+                measurementUnit
               )}</div>`,
               iconSize: [0, 0],
               iconAnchor: [0, 0],
             }),
-          });
+          }) as any;
+          label._drawnBy = (layer as any)._leaflet_id;
           label.addTo(map);
           drawnItems.addLayer(label);
         }
@@ -784,16 +952,18 @@ function DrawControl({
           icon: L.divIcon({
             className: "measurement-area-label-marker",
             html: `<div class="measurement-area-text">${formatArea(
-              area
+              area,
+              measurementUnit
             )}</div>`,
             iconSize: [0, 0],
             iconAnchor: [0, 0],
           }),
-        });
+        }) as any;
+        areaLabel._drawnBy = (layer as any)._leaflet_id;
         areaLabel.addTo(map);
         drawnItems.addLayer(areaLabel);
 
-        console.log(`📐 Polygon drawn: ${formatArea(area)}`);
+        console.log(`📐 Polygon drawn: ${formatArea(area, measurementUnit)}`);
       } else if (layer instanceof L.Marker) {
         // Marker - show coordinates as tooltip
         const latlng = layer.getLatLng();
@@ -1277,6 +1447,11 @@ export default function LocatorMap() {
   // Custom GeoJSON layers
   const [customLayers, setCustomLayers] = useState<CustomGeoJSONLayer[]>([]);
 
+  // Measurement unit state
+  const [measurementUnit, setMeasurementUnit] = useState<
+    "metric" | "imperial" | "mixed"
+  >("metric");
+
   // Search functionality state
   const [searchTerm, setSearchTerm] = useState("");
   const [searchResults, setSearchResults] = useState<SearchResult[]>([]);
@@ -1679,6 +1854,48 @@ export default function LocatorMap() {
             </div>
           </div>
         )}
+
+        {/* Measurement Unit Selector */}
+        <div style={{ marginBottom: 20 }}>
+          <h4 style={{ margin: "0 0 12px", fontSize: 14, color: "#1e293b" }}>
+            📏 Measurement Units
+          </h4>
+          <select
+            value={measurementUnit}
+            onChange={(e) =>
+              setMeasurementUnit(
+                e.target.value as "metric" | "imperial" | "mixed"
+              )
+            }
+            style={{
+              width: "100%",
+              padding: "8px 12px",
+              fontSize: 12,
+              backgroundColor: "#f8fafc",
+              border: "1px solid #cbd5e1",
+              borderRadius: 8,
+              cursor: "pointer",
+              fontWeight: 600,
+              color: "#1e293b",
+            }}
+          >
+            <option value="metric">Metric (m, km, m², ha)</option>
+            <option value="imperial">Imperial (ft, mi, ft², acres)</option>
+            <option value="mixed">Mixed (m + ft)</option>
+          </select>
+          <div
+            style={{
+              marginTop: 6,
+              fontSize: 10,
+              color: "#64748b",
+              fontStyle: "italic",
+            }}
+          >
+            {measurementUnit === "metric" && "• Distances in meters/kilometers"}
+            {measurementUnit === "imperial" && "• Distances in feet/miles"}
+            {measurementUnit === "mixed" && "• Shows both metric and imperial"}
+          </div>
+        </div>
 
         <h4 style={{ margin: "0 0 12px", fontSize: 14, color: "#1e293b" }}>
           📚 Layers
@@ -2261,7 +2478,10 @@ export default function LocatorMap() {
         />
 
         {/* Drawing tools */}
-        <DrawControl setIsDrawing={setIsDrawing} />
+        <DrawControl
+          setIsDrawing={setIsDrawing}
+          measurementUnit={measurementUnit}
+        />
 
         {/* Click → GetFeatureInfo with spatial filtering */}
         <MapClickInfo
