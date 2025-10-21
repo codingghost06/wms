@@ -7,6 +7,7 @@ import {
   useMap,
   useMapEvents,
   Popup,
+  GeoJSON,
 } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
@@ -1255,6 +1256,15 @@ function SearchResultController({
   return null;
 }
 
+// Custom GeoJSON layer type
+interface CustomGeoJSONLayer {
+  id: string;
+  name: string;
+  data: any;
+  visible: boolean;
+  color: string;
+}
+
 export default function LocatorMap() {
   const [visible, setVisible] = useState(
     () => new Set<LayerKey>(LAYERS.map((l) => l.key))
@@ -1263,6 +1273,9 @@ export default function LocatorMap() {
   const [availableLayers, setAvailableLayers] = useState<string[]>([]);
   const [showAvailableLayers, setShowAvailableLayers] = useState(false);
   const [isDrawing, setIsDrawing] = useState(false);
+
+  // Custom GeoJSON layers
+  const [customLayers, setCustomLayers] = useState<CustomGeoJSONLayer[]>([]);
 
   // Search functionality state
   const [searchTerm, setSearchTerm] = useState("");
@@ -1332,6 +1345,47 @@ export default function LocatorMap() {
       `%c⬜ ALL LAYERS DISABLED`,
       "color: #94a3b8; font-weight: bold"
     );
+  }
+
+  // Handle GeoJSON file upload
+  function handleGeoJSONUpload(event: React.ChangeEvent<HTMLInputElement>) {
+    const file = event.target.files?.[0];
+    if (!file) return;
+
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      try {
+        const geojson = JSON.parse(e.target?.result as string);
+        const newLayer: CustomGeoJSONLayer = {
+          id: `custom-${Date.now()}`,
+          name: file.name.replace(".geojson", "").replace(".json", ""),
+          data: geojson,
+          visible: true,
+          color: "#ff00ff", // Magenta for Ontario One Call
+        };
+        setCustomLayers((prev) => [...prev, newLayer]);
+        console.log(`✅ GeoJSON layer loaded: ${newLayer.name}`);
+      } catch (error) {
+        console.error("Error parsing GeoJSON:", error);
+        alert("Error loading GeoJSON file. Please check the format.");
+      }
+    };
+    reader.readAsText(file);
+    // Reset input
+    event.target.value = "";
+  }
+
+  function toggleCustomLayer(id: string) {
+    setCustomLayers((prev) =>
+      prev.map((layer) =>
+        layer.id === id ? { ...layer, visible: !layer.visible } : layer
+      )
+    );
+  }
+
+  function removeCustomLayer(id: string) {
+    setCustomLayers((prev) => prev.filter((layer) => layer.id !== id));
+    console.log(`🗑️ Custom layer removed: ${id}`);
   }
 
   // Fix default marker icon paths when bundling
@@ -1836,6 +1890,108 @@ export default function LocatorMap() {
           </div>
         ))}
 
+        {/* Custom GeoJSON Layers Section */}
+        <div style={{ marginTop: 20, marginBottom: 16 }}>
+          <h4 style={{ margin: "0 0 12px", fontSize: 14, color: "#1e293b" }}>
+            📁 Custom Layers (GeoJSON)
+          </h4>
+
+          {/* Upload button */}
+          <label
+            style={{
+              display: "block",
+              padding: "8px 12px",
+              backgroundColor: "#8b5cf6",
+              color: "white",
+              borderRadius: 8,
+              cursor: "pointer",
+              textAlign: "center",
+              fontSize: 12,
+              fontWeight: 600,
+              marginBottom: 12,
+            }}
+          >
+            📤 Upload GeoJSON
+            <input
+              type="file"
+              accept=".geojson,.json"
+              onChange={handleGeoJSONUpload}
+              style={{ display: "none" }}
+            />
+          </label>
+
+          {/* List of custom layers */}
+          {customLayers.length > 0 ? (
+            <div>
+              {customLayers.map((layer) => (
+                <div
+                  key={layer.id}
+                  style={{
+                    display: "flex",
+                    alignItems: "center",
+                    gap: 8,
+                    marginBottom: 6,
+                    padding: "6px 8px",
+                    backgroundColor: layer.visible ? "#fef3c7" : "transparent",
+                    borderRadius: 6,
+                    border: layer.visible
+                      ? "1px solid #fbbf24"
+                      : "1px solid transparent",
+                  }}
+                >
+                  <input
+                    type="checkbox"
+                    checked={layer.visible}
+                    onChange={() => toggleCustomLayer(layer.id)}
+                    style={{ width: 16, height: 16 }}
+                  />
+                  <div
+                    style={{
+                      width: 12,
+                      height: 12,
+                      borderRadius: "50%",
+                      backgroundColor: layer.color,
+                      border: "1px solid rgba(0,0,0,0.2)",
+                      flexShrink: 0,
+                    }}
+                  />
+                  <span style={{ flex: 1, fontSize: 12, color: "#1f2937" }}>
+                    {layer.name}
+                  </span>
+                  <button
+                    onClick={() => removeCustomLayer(layer.id)}
+                    style={{
+                      padding: "2px 6px",
+                      fontSize: 10,
+                      backgroundColor: "#ef4444",
+                      color: "white",
+                      border: "none",
+                      borderRadius: 4,
+                      cursor: "pointer",
+                      fontWeight: 600,
+                    }}
+                    title="Remove layer"
+                  >
+                    ✕
+                  </button>
+                </div>
+              ))}
+            </div>
+          ) : (
+            <div
+              style={{
+                padding: 8,
+                fontSize: 11,
+                color: "#6b7280",
+                fontStyle: "italic",
+                textAlign: "center",
+              }}
+            >
+              No custom layers loaded
+            </div>
+          )}
+        </div>
+
         {/* Color Legend */}
         <div
           style={{
@@ -2049,6 +2205,44 @@ export default function LocatorMap() {
                     `   └─ URL: ${e.tile?.src?.substring(0, 100)}...`
                   );
                 },
+              }}
+            />
+          );
+        })}
+
+        {/* Custom GeoJSON Layers */}
+        {customLayers.map((layer) => {
+          if (!layer.visible) return null;
+
+          return (
+            <GeoJSON
+              key={layer.id}
+              data={layer.data}
+              style={{
+                color: layer.color,
+                weight: 3,
+                opacity: 0.8,
+                fillColor: layer.color,
+                fillOpacity: 0.3,
+              }}
+              pointToLayer={(_feature, latlng) => {
+                return L.circleMarker(latlng, {
+                  radius: 6,
+                  fillColor: layer.color,
+                  color: "#000",
+                  weight: 1,
+                  opacity: 1,
+                  fillOpacity: 0.8,
+                });
+              }}
+              onEachFeature={(feature, layer) => {
+                if (feature.properties) {
+                  const props = feature.properties;
+                  const popupContent = Object.entries(props)
+                    .map(([key, value]) => `<b>${key}:</b> ${value}`)
+                    .join("<br>");
+                  layer.bindPopup(popupContent);
+                }
               }}
             />
           );
