@@ -365,86 +365,61 @@ async function fetchAvailableLayers(): Promise<string[]> {
   }
 }
 
-// Function to search for addresses using WFS (simplified approach)
+// Function to search for addresses using Nominatim (OpenStreetMap geocoding)
 async function searchAddresses(searchTerm: string): Promise<SearchResult[]> {
   try {
-    const wfsUrl = WMS_URL.replace("ows?", "ows");
+    if (!searchTerm.trim()) return [];
 
-    // Get all features first (without CQL filter to avoid field name issues)
+    // Use Nominatim for geocoding (free, no API key required)
     const params = new URLSearchParams({
-      service: "WFS",
-      version: "2.0.0",
-      request: "GetFeature",
-      typeName: "waterloo:Addresses",
-      outputFormat: "application/json",
-      maxFeatures: "100", // Get more features to filter client-side
+      q: searchTerm,
+      format: "json",
+      addressdetails: "1",
+      limit: "10",
+      // Bounding box for Waterloo region (expanded for better coverage)
+      // Format: left,top,right,bottom (min_lon, max_lat, max_lon, min_lat)
+      // Covers Waterloo, Kitchener, Cambridge, and surrounding areas
+      viewbox: "-80.8,43.3,-80.2,43.7",
+      bounded: "1", // Restrict results to viewbox
+      countrycodes: "ca", // Restrict to Canada
     });
 
-    const response = await fetch(`${wfsUrl}?${params.toString()}`);
+    const response = await fetch(
+      `https://nominatim.openstreetmap.org/search?${params.toString()}`,
+      {
+        headers: {
+          "User-Agent": "WMS-Viewer/1.0", // Nominatim requires a User-Agent
+        },
+      }
+    );
 
-    // Check if response is JSON or XML (error)
-    const contentType = response.headers.get("content-type") || "";
-    if (contentType.includes("xml")) {
-      const errorText = await response.text();
-      console.error("WFS Error:", errorText);
+    if (!response.ok) {
+      console.error("Nominatim error:", response.statusText);
       return [];
     }
 
     const data = await response.json();
 
-    if (data.features && data.features.length > 0) {
-      // Log the first feature to see available fields (for debugging)
-      console.log("Sample address feature:", data.features[0]);
-      console.log(
-        "Available fields:",
-        Object.keys(data.features[0].properties)
-      );
+    console.log(
+      `🔍 Geocoding results for "${searchTerm}":`,
+      data.length,
+      "found"
+    );
 
-      // Filter results client-side based on the search term
-      const searchLower = searchTerm.toLowerCase();
-      const filteredFeatures = data.features.filter((feature: any) => {
-        const props = feature.properties;
-
-        // Search in all string properties
-        return Object.values(props).some(
-          (value: any) =>
-            value &&
-            typeof value === "string" &&
-            value.toLowerCase().includes(searchLower)
-        );
-      });
-
-      return filteredFeatures.slice(0, 20).map((feature: any) => {
-        const props = feature.properties;
-        const coords = feature.geometry.coordinates;
-
-        // Build address string from all available string fields
-        const addressParts: string[] = [];
-
-        // Add all non-null string values to create an address
-        Object.entries(props).forEach(([key, value]: [string, any]) => {
-          if (value && typeof value === "string" && value.trim()) {
-            // Skip obviously non-address fields
-            if (
-              !key.toLowerCase().includes("id") &&
-              !key.toLowerCase().includes("objectid") &&
-              !key.toLowerCase().includes("fid")
-            ) {
-              addressParts.push(value.trim());
-            }
-          }
-        });
-
-        return {
-          id: feature.id || `addr_${Math.random()}`,
-          address: addressParts.join(" ") || "Address",
-          coordinates: [coords[1], coords[0]] as [number, number], // Lat, Lng
-          properties: props,
-        };
-      });
-    }
-
-    return [];
+    return data.map((result: any) => ({
+      id: result.place_id.toString(),
+      address: result.display_name,
+      coordinates: [parseFloat(result.lat), parseFloat(result.lon)] as [
+        number,
+        number
+      ],
+      properties: {
+        type: result.type,
+        class: result.class,
+        importance: result.importance,
+        ...result.address,
+      },
+    }));
   } catch (error) {
     console.error("Error searching addresses:", error);
     return [];
@@ -1408,10 +1383,10 @@ function SearchResultController({
 
       // Add a search radius circle
       const circle = L.circle(selectedResult.coordinates, {
-        radius: 50, // 50 meters
+        radius: 20, // 20 meters (reduced from 50)
         color: "#ff4444",
         fillColor: "#ff4444",
-        fillOpacity: 0.1,
+        fillOpacity: 0.15,
         weight: 2,
         dashArray: "5, 5",
       }).addTo(map);
@@ -1627,7 +1602,38 @@ export default function LocatorMap() {
     fetchAvailableLayers().then(setAvailableLayers);
   }, []);
 
-  // Search functionality
+  // Debounced search functionality (auto-search as user types)
+  useEffect(() => {
+    const delayTimer = setTimeout(async () => {
+      if (searchTerm.trim().length >= 3) {
+        // Only search if at least 3 characters
+        setIsSearching(true);
+        try {
+          const results = await searchAddresses(searchTerm);
+          setSearchResults(results);
+          if (results.length > 0) {
+            console.log(
+              `✅ Found ${results.length} results for "${searchTerm}"`
+            );
+          } else {
+            console.log(`ℹ️ No results found for "${searchTerm}"`);
+          }
+        } catch (error) {
+          console.error("Search error:", error);
+          setSearchResults([]);
+        } finally {
+          setIsSearching(false);
+        }
+      } else if (searchTerm.trim().length === 0) {
+        // Clear results when search is empty
+        setSearchResults([]);
+      }
+    }, 500); // 500ms delay after user stops typing
+
+    return () => clearTimeout(delayTimer);
+  }, [searchTerm]);
+
+  // Manual search trigger (for Enter key)
   const handleSearch = async () => {
     if (!searchTerm.trim()) return;
 
@@ -1650,7 +1656,7 @@ export default function LocatorMap() {
     // Search for nearby features
     const nearby = await searchNearbyFeatures(
       result.coordinates,
-      50, // 50 meter radius
+      20, // 20 meter radius (matches circle size)
       visibleLayerKeys
     );
     setNearbyFeatures(nearby);
@@ -1688,13 +1694,43 @@ export default function LocatorMap() {
             border: "1px solid #e5e7eb",
           }}
         >
-          <h4 style={{ margin: "0 0 10px", fontSize: 14, color: "#1e293b" }}>
-            🔍 Search Address
-          </h4>
-          <div style={{ display: "flex", gap: 6 }}>
+          <div
+            style={{
+              display: "flex",
+              alignItems: "center",
+              gap: 8,
+              marginBottom: 10,
+            }}
+          >
+            <h4 style={{ margin: 0, fontSize: 14, color: "#1e293b", flex: 1 }}>
+              🔍 Search Address
+            </h4>
+            {searchTerm && (
+              <button
+                onClick={() => {
+                  setSearchTerm("");
+                  setSearchResults([]);
+                  setSelectedResult(null);
+                }}
+                style={{
+                  padding: "4px 8px",
+                  fontSize: 11,
+                  backgroundColor: "#ef4444",
+                  color: "white",
+                  border: "none",
+                  borderRadius: 6,
+                  cursor: "pointer",
+                  fontWeight: 600,
+                }}
+              >
+                Clear
+              </button>
+            )}
+          </div>
+          <div style={{ display: "flex", gap: 6, position: "relative" }}>
             <input
               type="text"
-              placeholder="Search addresses..."
+              placeholder="e.g. University of Waterloo..."
               value={searchTerm}
               onChange={(e) => setSearchTerm(e.target.value)}
               onKeyPress={(e) => e.key === "Enter" && handleSearch()}
@@ -1702,66 +1738,143 @@ export default function LocatorMap() {
                 flex: 1,
                 padding: "8px 10px",
                 fontSize: 13,
-                border: "1px solid #d1d5db",
+                border: isSearching ? "1px solid #3b82f6" : "1px solid #d1d5db",
                 borderRadius: 8,
                 outline: "none",
-                transition: "border-color 0.2s",
+                transition: "all 0.2s",
+                backgroundColor: isSearching ? "#eff6ff" : "white",
               }}
-              onFocus={(e) => (e.target.style.borderColor = "#007cba")}
-              onBlur={(e) => (e.target.style.borderColor = "#d1d5db")}
+              onFocus={(e) => {
+                if (!isSearching) e.target.style.borderColor = "#007cba";
+              }}
+              onBlur={(e) => {
+                if (!isSearching) e.target.style.borderColor = "#d1d5db";
+              }}
             />
-            <button
-              onClick={handleSearch}
-              disabled={!searchTerm.trim() || isSearching}
-              style={{
-                padding: "8px 14px",
-                fontSize: 13,
-                backgroundColor: "#007cba",
-                color: "white",
-                border: "none",
-                borderRadius: 8,
-                cursor:
-                  !searchTerm.trim() || isSearching ? "not-allowed" : "pointer",
-                opacity: !searchTerm.trim() || isSearching ? 0.6 : 1,
-                fontWeight: 600,
-              }}
-            >
-              {isSearching ? "..." : "Search"}
-            </button>
+            {isSearching && (
+              <div
+                style={{
+                  position: "absolute",
+                  right: "10px",
+                  top: "50%",
+                  transform: "translateY(-50%)",
+                  color: "#3b82f6",
+                  fontSize: 11,
+                  fontWeight: 600,
+                }}
+              >
+                🔄 Searching...
+              </div>
+            )}
           </div>
 
+          {/* Helper text */}
+          {searchTerm.length > 0 && searchTerm.length < 3 && (
+            <div
+              style={{
+                marginTop: 6,
+                fontSize: 11,
+                color: "#6b7280",
+                fontStyle: "italic",
+              }}
+            >
+              Type {3 - searchTerm.length} more character
+              {3 - searchTerm.length > 1 ? "s" : ""}...
+            </div>
+          )}
+
           {/* Search Results */}
+          {searchTerm.length >= 3 &&
+            !isSearching &&
+            searchResults.length === 0 &&
+            !selectedResult && (
+              <div
+                style={{
+                  marginTop: 10,
+                  padding: 12,
+                  backgroundColor: "#fef2f2",
+                  borderRadius: 8,
+                  fontSize: 12,
+                  color: "#991b1b",
+                  border: "1px solid #fecaca",
+                  textAlign: "center",
+                }}
+              >
+                ℹ️ No results found for "{searchTerm}"
+                <br />
+                <span style={{ fontSize: 11, color: "#b91c1c" }}>
+                  Try a different location in Waterloo region
+                </span>
+              </div>
+            )}
+
           {searchResults.length > 0 && (
             <div
               style={{
                 marginTop: 10,
-                maxHeight: 140,
+                maxHeight: 300,
                 overflow: "auto",
                 border: "1px solid #d1d5db",
                 borderRadius: 8,
                 backgroundColor: "white",
+                boxShadow: "0 4px 6px rgba(0, 0, 0, 0.1)",
               }}
             >
-              {searchResults.map((result) => (
+              <div
+                style={{
+                  padding: "6px 10px",
+                  fontSize: 11,
+                  color: "#6b7280",
+                  backgroundColor: "#f9fafb",
+                  borderBottom: "1px solid #e5e7eb",
+                  fontWeight: 600,
+                }}
+              >
+                {searchResults.length} result
+                {searchResults.length > 1 ? "s" : ""} found
+              </div>
+              {searchResults.map((result, idx) => (
                 <div
                   key={result.id}
                   onClick={() => handleResultSelect(result)}
                   style={{
-                    padding: "8px 10px",
+                    padding: "10px 12px",
                     fontSize: 12,
-                    borderBottom: "1px solid #f3f4f6",
+                    borderBottom:
+                      idx < searchResults.length - 1
+                        ? "1px solid #f3f4f6"
+                        : "none",
                     cursor: "pointer",
                     backgroundColor: "white",
                     transition: "background-color 0.15s",
+                    display: "flex",
+                    alignItems: "start",
+                    gap: 8,
                   }}
                   onMouseEnter={(e) => {
-                    e.currentTarget.style.backgroundColor = "#f3f4f6";
+                    e.currentTarget.style.backgroundColor = "#eff6ff";
                   }}
                   onMouseLeave={(e) => {
                     e.currentTarget.style.backgroundColor = "white";
                   }}
                 >
-                  📍 {result.address}
+                  <span style={{ fontSize: 16 }}>📍</span>
+                  <div style={{ flex: 1 }}>
+                    <div style={{ fontWeight: 600, color: "#1f2937" }}>
+                      {result.address.split(",")[0]}
+                    </div>
+                    {result.address.includes(",") && (
+                      <div
+                        style={{
+                          fontSize: 11,
+                          color: "#6b7280",
+                          marginTop: 2,
+                        }}
+                      >
+                        {result.address.split(",").slice(1).join(",")}
+                      </div>
+                    )}
+                  </div>
                 </div>
               ))}
             </div>
